@@ -8,7 +8,7 @@ Rules-Requires-Root: no
 
 Package: nasty-proxmox-plugin
 Architecture: all
-Depends: pve-manager (>= 8.0.0), open-iscsi, libio-socket-ssl-perl, liburi-perl, perl, ${misc:Depends}, ${perl:Depends}
+Depends: pve-manager (>= 8.0.0), open-iscsi, libio-socket-ssl-perl, liburi-perl, libjson-xs-perl, perl, ${misc:Depends}, ${perl:Depends}
 Recommends: nvme-cli
 Description: Nasty NAS storage plugin for Proxmox VE
  Provides shared VM block storage over iSCSI and NVMe/TCP using a Nasty

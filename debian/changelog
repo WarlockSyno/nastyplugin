@@ -1,4 +1,4 @@
-nasty-proxmox-plugin (0.1.0) stable; urgency=medium
+nasty-proxmox-plugin (0.1.0) bookworm; urgency=medium
 
   * Initial release.
 
