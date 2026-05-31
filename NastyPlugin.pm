@@ -817,8 +817,6 @@ sub path {
         # Create clone if it doesn't already exist
         my $existing = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $clone_name }) };
         unless ($existing) {
-            my $sv_part = $volname;
-            $sv_part =~ s!^\Q$scfg->{nasty_subvolume_prefix}\E/!!;
             _api_call($scfg, 'snapshot.clone', {
                 filesystem => $fs,
                 subvolume  => $volname,
