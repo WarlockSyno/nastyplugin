@@ -409,5 +409,174 @@ sub _api_call {
     return $result;
 }
 
+# Returns lun_id or undef if not found.
+sub _iscsi_find_lun {
+    my ($scfg, $block_device) = @_;
+    my $targets = _api_call($scfg, 'share.iscsi.list');
+    my $target_iqn = $scfg->{nasty_iscsi_target};
+    for my $t (@$targets) {
+        next unless $t->{iqn} eq $target_iqn;
+        for my $lun (@{ $t->{luns} // [] }) {
+            return $lun->{lun_id} if $lun->{backstore_path} eq $block_device;
+        }
+    }
+    return undef;
+}
+
+sub _iscsi_target_id {
+    my ($scfg) = @_;
+    my $targets = _api_call($scfg, 'share.iscsi.list');
+    my $target_iqn = $scfg->{nasty_iscsi_target};
+    for my $t (@$targets) {
+        return $t->{id} if $t->{iqn} eq $target_iqn;
+    }
+    die "[Nasty] iSCSI target '$target_iqn' not found on Nasty\n";
+}
+
+sub _iscsi_login {
+    my ($scfg) = @_;
+    my $iqn  = $scfg->{nasty_iscsi_target};
+    my $host = $scfg->{nasty_api_host};
+    _log($scfg, 1, "[Nasty] iSCSI login: target=$iqn portal=$host");
+    system('iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $host) == 0
+        or warn "[Nasty] iSCSI discovery failed (continuing)\n";
+    system('iscsiadm', '-m', 'node', '-T', $iqn, '-p', $host, '--login') == 0
+        or die "[Nasty] iSCSI login failed for target $iqn\n";
+    sleep(2);  # wait for udev to create device nodes
+}
+
+sub _iscsi_rescan {
+    my ($scfg, $lun_id) = @_;
+    my $iqn = $scfg->{nasty_iscsi_target};
+    system('iscsiadm', '-m', 'session', '--rescan') == 0
+        or warn "[Nasty] iSCSI rescan returned non-zero (continuing)\n";
+    sleep(1);
+    # Find device via /dev/disk/by-path
+    my $by_path = "/dev/disk/by-path";
+    opendir(my $dh, $by_path) or return undef;
+    my @links = grep { /iscsi-$iqn.*lun-$lun_id$/ } readdir($dh);
+    closedir($dh);
+    return undef unless @links;
+    return readlink("$by_path/$links[0]")
+        ? "$by_path/$links[0]"
+        : undef;
+}
+
+# Returns nsid or undef if not found.
+sub _nvme_find_ns {
+    my ($scfg, $block_device) = @_;
+    my $subsystems = _api_call($scfg, 'share.nvmeof.list');
+    my $target_name = $scfg->{nasty_nvme_subsystem};
+    for my $s (@$subsystems) {
+        next unless ($s->{nqn} // '') =~ /\Q$target_name\E/ || ($s->{id} // '') eq $target_name;
+        for my $ns (@{ $s->{namespaces} // [] }) {
+            return $ns->{nsid} if $ns->{device_path} eq $block_device;
+        }
+    }
+    return undef;
+}
+
+sub _nvme_subsystem_id {
+    my ($scfg) = @_;
+    my $subsystems = _api_call($scfg, 'share.nvmeof.list');
+    my $target_name = $scfg->{nasty_nvme_subsystem};
+    for my $s (@$subsystems) {
+        return $s->{id}
+            if ($s->{nqn} // '') =~ /\Q$target_name\E/
+            || ($s->{id} // '') eq $target_name;
+    }
+    die "[Nasty] NVMe-oF subsystem '$target_name' not found on Nasty\n";
+}
+
+sub _nvme_connect {
+    my ($scfg) = @_;
+    my $subsystems = _api_call($scfg, 'share.nvmeof.list');
+    my $target_name = $scfg->{nasty_nvme_subsystem};
+    my ($subsys) = grep {
+        ($_->{nqn} // '') =~ /\Q$target_name\E/ || ($_->{id} // '') eq $target_name
+    } @$subsystems;
+    die "[Nasty] NVMe-oF subsystem '$target_name' not found\n" unless $subsys;
+
+    my $nqn  = $subsys->{nqn};
+    my $host = $scfg->{nasty_api_host};
+    my $port = 4420;
+    if (my $p = $subsys->{ports} && $subsys->{ports}[0]) {
+        $port = $p->{service_id} // 4420;
+    }
+
+    my $hostnqn = $scfg->{nasty_nvme_hostnqn};
+    unless ($hostnqn) {
+        open(my $fh, '<', '/etc/nvme/hostnqn') or die "[Nasty] cannot read /etc/nvme/hostnqn: $!\n";
+        $hostnqn = do { local $/; <$fh> };
+        chomp $hostnqn;
+        close $fh;
+    }
+
+    _log($scfg, 1, "[Nasty] NVMe connect: nqn=$nqn host=$host:$port");
+    system('nvme', 'connect', '-t', 'tcp', '-n', $nqn, '-a', $host, '-s', $port,
+           '--hostnqn', $hostnqn) == 0
+        or die "[Nasty] nvme connect failed for $nqn\n";
+    sleep(2);
+}
+
+sub _nvme_rescan {
+    my ($scfg, $device_path) = @_;
+    # device_path is a loop device like /dev/loop3
+    # After nvme connect, the namespace appears as /dev/nvmeXnY
+    # Find it by scanning nvme subsystem controllers
+    sleep(1);
+    my @devs = glob('/dev/nvme*n*');
+    for my $dev (@devs) {
+        next unless $dev =~ m!/dev/nvme\d+n\d+$!;
+        # Check if the backing device matches via sysfs
+        my $nsdev = $dev;
+        $nsdev =~ s!/dev/!!;
+        my $sysfs = "/sys/class/block/$nsdev/device";
+        next unless -e $sysfs;
+        return $dev;
+    }
+    return undef;
+}
+
+sub _add_to_share {
+    my ($scfg, $block_device) = @_;
+    my $mode = $scfg->{nasty_transport_mode} // 'iscsi';
+    if ($mode eq 'iscsi') {
+        my $tid = _iscsi_target_id($scfg);
+        return _api_call($scfg, 'share.iscsi.add_lun', {
+            target_id    => $tid,
+            backstore_path => $block_device,
+        });
+    } else {
+        my $sid = _nvme_subsystem_id($scfg);
+        return _api_call($scfg, 'share.nvmeof.add_namespace', {
+            subsystem_id => $sid,
+            device_path  => $block_device,
+        });
+    }
+}
+
+sub _remove_from_share {
+    my ($scfg, $block_device) = @_;
+    my $mode = $scfg->{nasty_transport_mode} // 'iscsi';
+    if ($mode eq 'iscsi') {
+        my $lun_id = _iscsi_find_lun($scfg, $block_device);
+        return unless defined $lun_id;
+        my $tid = _iscsi_target_id($scfg);
+        _api_call($scfg, 'share.iscsi.remove_lun', {
+            target_id => $tid,
+            lun_id    => $lun_id,
+        });
+    } else {
+        my $nsid = _nvme_find_ns($scfg, $block_device);
+        return unless defined $nsid;
+        my $sid = _nvme_subsystem_id($scfg);
+        _api_call($scfg, 'share.nvmeof.remove_namespace', {
+            subsystem_id => $sid,
+            nsid         => $nsid,
+        });
+    }
+}
+
 1;
 
