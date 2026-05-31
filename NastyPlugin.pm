@@ -598,5 +598,105 @@ sub _remove_from_share {
     }
 }
 
+# ---------------------------------------------------------------------------
+# PVE storage interface methods
+# ---------------------------------------------------------------------------
+
+sub activate_storage {
+    my ($class, $storeid, $scfg, $cache) = @_;
+
+    # 1. Verify API connectivity
+    my $info = _api_call($scfg, 'system.info');
+    _log($scfg, 1, "[Nasty] connected to Nasty $info->{version}");
+
+    # 2. Ensure prefix subvolume exists
+    my $fs     = $scfg->{nasty_filesystem};
+    my $prefix = $scfg->{nasty_subvolume_prefix};
+    my $existing = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $prefix }) };
+    unless ($existing) {
+        _log($scfg, 1, "[Nasty] creating prefix subvolume '$prefix' on filesystem '$fs'");
+        _api_call($scfg, 'subvolume.create', {
+            filesystem    => $fs,
+            name          => $prefix,
+            subvolume_type => 'Filesystem',
+        });
+    }
+
+    # 3. Verify target/subsystem exists
+    my $mode = $scfg->{nasty_transport_mode} // 'iscsi';
+    if ($mode eq 'iscsi') {
+        _iscsi_target_id($scfg);  # dies if not found
+    } else {
+        _nvme_subsystem_id($scfg);  # dies if not found
+    }
+
+    return 1;
+}
+
+sub status {
+    my ($class, $storeid, $scfg, $cache) = @_;
+
+    my $usage = eval { _api_call($scfg, 'fs.usage', { name => $scfg->{nasty_filesystem} }) };
+    if ($@) {
+        warn "[Nasty] status failed: $@";
+        return (0, 0, 0, 0);
+    }
+
+    # Sum across all devices
+    my ($total, $free) = (0, 0);
+    for my $dev (@{ $usage->{devices} // [] }) {
+        $total += $dev->{total_bytes} // 0;
+        $free  += $dev->{free_bytes}  // 0;
+    }
+    my $used = $total - $free;
+
+    return ($total, $free, $used, 1);
+}
+
+sub list_images {
+    my ($class, $storeid, $scfg, $vmid, $vollist, $cache) = @_;
+
+    my $fs     = $scfg->{nasty_filesystem};
+    my $prefix = $scfg->{nasty_subvolume_prefix};
+
+    my $subvols = eval { _api_call($scfg, 'subvolume.list', { filesystem => $fs }) };
+    if ($@) {
+        warn "[Nasty] list_images failed: $@";
+        return [];
+    }
+
+    my @res;
+    for my $sv (@$subvols) {
+        my $name = $sv->{name};
+
+        # Only manage volumes under our prefix
+        next unless $name =~ m!^\Q$prefix\E/vm-(\d+)-!;
+        my $svmid = $1;
+
+        # Skip snapclones
+        next if $name =~ m!/pve-snapclone-!;
+
+        # Filter by vmid if requested
+        next if defined $vmid && $svmid != $vmid;
+
+        my $volname = $name;
+        my $volid   = "$storeid:$volname";
+
+        if ($vollist) {
+            next unless grep { $_ eq $volid } @$vollist;
+        }
+
+        push @res, {
+            volid  => $volid,
+            format => 'raw',
+            size   => $sv->{volsize_bytes} // 0,
+            vmid   => $svmid,
+            content => 'images',
+        };
+    }
+
+    return \@res;
+}
+
 1;
 
