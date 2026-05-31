@@ -613,6 +613,7 @@ sub activate_storage {
     my $fs     = $scfg->{nasty_filesystem};
     my $prefix = $scfg->{nasty_subvolume_prefix};
     my $existing = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $prefix }) };
+    if ($@ && $@ !~ /not found/i) { die $@; }
     unless ($existing) {
         _log($scfg, 1, "[Nasty] creating prefix subvolume '$prefix' on filesystem '$fs'");
         _api_call($scfg, 'subvolume.create', {
@@ -665,6 +666,8 @@ sub list_images {
         return [];
     }
 
+    my %want = $vollist ? (map { $_ => 1 } @$vollist) : ();
+
     my @res;
     for my $sv (@$subvols) {
         my $name = $sv->{name};
@@ -683,7 +686,7 @@ sub list_images {
         my $volid   = "$storeid:$volname";
 
         if ($vollist) {
-            next unless grep { $_ eq $volid } @$vollist;
+            next unless $want{$volid};
         }
 
         push @res, {
