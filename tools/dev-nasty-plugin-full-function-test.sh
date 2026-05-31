@@ -25,7 +25,7 @@ pass "storage status"
 
 # 2. Allocate a disk
 echo "--- 2. alloc_image ---"
-VOLID=$(pvesm alloc "$STORAGE" "$VMID" "" 1G 2>&1)
+VOLID=$(pvesm alloc "$STORAGE" "$VMID" "" 1G)
 echo "  Allocated: $VOLID"
 [[ -n "$VOLID" ]] || fail "alloc returned empty"
 VOLNAME="${VOLID#*:}"
@@ -71,7 +71,7 @@ pass "path"
 # 10. Free image
 echo "--- 10. free_image ---"
 pvesm free "$STORAGE:$VOLNAME" || fail "free failed"
-pvesm list "$STORAGE" --vmid "$VMID" | grep "$VOLNAME" && fail "volume still in list after free"
+pvesm list "$STORAGE" --vmid "$VMID" | grep -q "$VOLNAME" && fail "volume still in list after free" || true
 pass "free_image"
 
 echo
