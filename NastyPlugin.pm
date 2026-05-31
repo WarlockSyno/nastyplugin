@@ -968,5 +968,31 @@ sub volume_snapshot_info {
     return undef;
 }
 
+sub volume_size_info {
+    my ($class, $scfg, $storeid, $volname, $timeout) = @_;
+
+    my $sv = _api_call($scfg, 'subvolume.get', {
+        filesystem => $scfg->{nasty_filesystem},
+        name       => $volname,
+    });
+
+    return ($sv->{volsize_bytes} // 0, 'raw', $sv->{used_bytes} // 0, undef);
+}
+
+sub volume_resize {
+    my ($class, $scfg, $storeid, $volname, $size, $running) = @_;
+
+    # size arrives in bytes from Proxmox
+    _log($scfg, 1, "[Nasty] volume_resize: $volname to $size bytes");
+
+    _api_call($scfg, 'subvolume.resize', {
+        filesystem    => $scfg->{nasty_filesystem},
+        name          => $volname,
+        volsize_bytes => $size,
+    });
+
+    return undef;
+}
+
 1;
 
