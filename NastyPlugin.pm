@@ -29,6 +29,7 @@ my %CACHE_TTL = (
     'share.iscsi.list'    => 60,
     'share.nvmeof.list'   => 60,
     'system.info'         => 300,
+    'snapshot.list'       => 10,
 );
 
 # Methods that invalidate cache keys on success
@@ -440,8 +441,10 @@ sub _iscsi_login {
     _log($scfg, 1, "[Nasty] iSCSI login: target=$iqn portal=$host");
     system('iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $host) == 0
         or warn "[Nasty] iSCSI discovery failed (continuing)\n";
-    system('iscsiadm', '-m', 'node', '-T', $iqn, '-p', $host, '--login') == 0
-        or die "[Nasty] iSCSI login failed for target $iqn\n";
+    my $ret = system('iscsiadm', '-m', 'node', '-T', $iqn, '-p', $host, '--login');
+    my $exit_code = $ret >> 8;
+    die "[Nasty] iSCSI login failed for target $iqn (exit $exit_code)\n"
+        unless $exit_code == 0 || $exit_code == 15;  # 15 = ISCSI_ERR_SESS_EXISTS
     sleep(2);  # wait for udev to create device nodes
 }
 
@@ -513,9 +516,12 @@ sub _nvme_connect {
     }
 
     _log($scfg, 1, "[Nasty] NVMe connect: nqn=$nqn host=$host:$port");
-    system('nvme', 'connect', '-t', 'tcp', '-n', $nqn, '-a', $host, '-s', $port,
-           '--hostnqn', $hostnqn) == 0
-        or die "[Nasty] nvme connect failed for $nqn\n";
+    my $ret = system('nvme', 'connect', '-t', 'tcp', '-n', $nqn, '-a', $host, '-s', $port,
+                     '--hostnqn', $hostnqn);
+    # nvme connect returns 70 (EALREADY) when controller is already connected; treat as success
+    my $exit_code = $ret >> 8;
+    die "[Nasty] nvme connect failed for $nqn (exit $exit_code)\n"
+        unless $exit_code == 0 || $exit_code == 70;
     sleep(2);
 }
 
@@ -816,6 +822,7 @@ sub path {
 
         # Create clone if it doesn't already exist
         my $existing = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $clone_name }) };
+        die $@ if $@ && $@ !~ /not found/i;
         unless ($existing) {
             _api_call($scfg, 'snapshot.clone', {
                 filesystem => $fs,
@@ -880,6 +887,7 @@ sub deactivate_volume {
     my $clone_name = _snapclone_volname($scfg, $volname, $snapname);
 
     my $existing = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $clone_name }) };
+    die $@ if $@ && $@ !~ /not found/i;
     unless ($existing) {
         _log($scfg, 1, "[Nasty] deactivate_volume: snap-clone $clone_name not found, nothing to do");
         return 1;
