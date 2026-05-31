@@ -778,5 +778,125 @@ sub free_image {
     return undef;
 }
 
+sub _resolve_dev_path {
+    my ($scfg, $block_device) = @_;
+    my $mode = $scfg->{nasty_transport_mode} // 'iscsi';
+
+    if ($mode eq 'iscsi') {
+        my $lun_id = _iscsi_find_lun($scfg, $block_device);
+        die "[Nasty] no LUN found for block device $block_device\n" unless defined $lun_id;
+        my $dev = _iscsi_rescan($scfg, $lun_id);
+        die "[Nasty] device not found for LUN $lun_id after rescan\n" unless $dev;
+        return $dev;
+    } elsif ($mode eq 'nvme-tcp') {
+        my $dev = _nvme_rescan($scfg, $block_device);
+        die "[Nasty] NVMe device not found for $block_device after connect\n" unless $dev;
+        return $dev;
+    } else {
+        die "[Nasty] unknown transport mode '$mode'\n";
+    }
+}
+
+sub _snapclone_volname {
+    my ($scfg, $volname, $snapname) = @_;
+    my $prefix = $scfg->{nasty_subvolume_prefix};
+    # volname is like "pve/vm-100-disk-0", extract disk part
+    (my $diskpart = $volname) =~ s!^\Q$prefix\E/!!;
+    return "$prefix/pve-snapclone-$diskpart-$snapname";
+}
+
+sub path {
+    my ($class, $scfg, $volname, $storeid, $snapname) = @_;
+
+    my $fs = $scfg->{nasty_filesystem};
+
+    if ($snapname) {
+        # vzdump snap-clone flow: clone snapshot → expose → return dev path
+        my $clone_name = _snapclone_volname($scfg, $volname, $snapname);
+
+        # Create clone if it doesn't already exist
+        my $existing = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $clone_name }) };
+        unless ($existing) {
+            my $sv_part = $volname;
+            $sv_part =~ s!^\Q$scfg->{nasty_subvolume_prefix}\E/!!;
+            _api_call($scfg, 'snapshot.clone', {
+                filesystem => $fs,
+                subvolume  => $volname,
+                snapshot   => $snapname,
+                new_name   => $clone_name,
+            });
+            $existing = _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $clone_name });
+        }
+
+        my $block_device = $existing->{block_device}
+            or die "[Nasty] snap-clone $clone_name has no block_device\n";
+
+        # Expose if not already in share
+        my $already = ($scfg->{nasty_transport_mode} // 'iscsi') eq 'iscsi'
+            ? _iscsi_find_lun($scfg, $block_device)
+            : _nvme_find_ns($scfg, $block_device);
+
+        _add_to_share($scfg, $block_device) unless defined $already;
+
+        # Ensure transport is connected
+        my $mode = $scfg->{nasty_transport_mode} // 'iscsi';
+        $mode eq 'iscsi' ? _iscsi_login($scfg) : _nvme_connect($scfg);
+
+        return (_resolve_dev_path($scfg, $block_device), undef, 'raw');
+    }
+
+    # No snapname: resolve current block device
+    my $sv = _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $volname });
+    my $block_device = $sv->{block_device}
+        or die "[Nasty] $volname has no block_device\n";
+
+    return (_resolve_dev_path($scfg, $block_device), undef, 'raw');
+}
+
+sub activate_volume {
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+
+    my $mode = $scfg->{nasty_transport_mode} // 'iscsi';
+
+    if ($snapname) {
+        # Snap-clone path: path() does the heavy lifting
+        my (undef) = path($class, $scfg, $volname, $storeid, $snapname);
+        return 1;
+    }
+
+    # Normal volume: ensure transport is connected
+    $mode eq 'iscsi' ? _iscsi_login($scfg) : _nvme_connect($scfg);
+    return 1;
+}
+
+sub deactivate_volume {
+    my ($class, $storeid, $scfg, $volname, $snapname, $cache) = @_;
+
+    unless ($snapname) {
+        # Shared target stays connected — no-op
+        return 1;
+    }
+
+    # Tear down snap-clone
+    my $fs         = $scfg->{nasty_filesystem};
+    my $clone_name = _snapclone_volname($scfg, $volname, $snapname);
+
+    my $existing = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $clone_name }) };
+    unless ($existing) {
+        _log($scfg, 1, "[Nasty] deactivate_volume: snap-clone $clone_name not found, nothing to do");
+        return 1;
+    }
+
+    if (my $block_device = $existing->{block_device}) {
+        eval { _remove_from_share($scfg, $block_device) };
+        warn "[Nasty] deactivate snap-clone: remove_from_share warning: $@" if $@;
+    }
+
+    eval { _api_call($scfg, 'subvolume.delete', { filesystem => $fs, name => $clone_name }) };
+    warn "[Nasty] deactivate snap-clone: delete warning: $@" if $@;
+
+    return 1;
+}
+
 1;
 
