@@ -1,0 +1,16 @@
+Source: nasty-proxmox-plugin
+Section: admin
+Priority: optional
+Maintainer: NastyPlugin Maintainers <noreply@github.com>
+Build-Depends: debhelper-compat (= 13), perl
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: nasty-proxmox-plugin
+Architecture: all
+Depends: pve-manager (>= 8.0.0), open-iscsi, libio-socket-ssl-perl, liburi-perl, perl, ${misc:Depends}, ${perl:Depends}
+Recommends: nvme-cli
+Description: Nasty NAS storage plugin for Proxmox VE
+ Provides shared VM block storage over iSCSI and NVMe/TCP using a Nasty
+ NAS appliance. Manages bcachefs Block subvolumes via the Nasty JSON-RPC
+ WebSocket API.

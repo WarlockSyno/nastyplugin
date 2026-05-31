@@ -1,0 +1,6 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+    systemctl restart pvestatd  2>/dev/null || true
+    systemctl restart pvedaemon 2>/dev/null || true
+fi
