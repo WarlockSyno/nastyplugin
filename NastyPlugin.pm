@@ -231,16 +231,33 @@ sub _ws_connect {
     );
     print $sock $req;
 
-    # Read response headers
+    # Read response headers (10s timeout)
+    my $sel = IO::Select->new($sock);
     my $response = '';
     while (1) {
+        unless ($sel->can_read(10)) {
+            die "[Nasty] WebSocket upgrade timed out after 10s\n";
+        }
         my $line;
-        $sock->read($line, 1);
+        $sock->read($line, 1) or die "[Nasty] WebSocket upgrade: connection closed\n";
         $response .= $line;
         last if $response =~ /\r\n\r\n$/;
     }
     die "[Nasty] WebSocket upgrade failed: $response\n"
         unless $response =~ /^HTTP\/1\.1 101/;
+
+    # Verify Sec-WebSocket-Accept (RFC 6455 §4.1)
+    my $expected_accept = encode_base64(
+        sha1($ws_key . '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'), ''
+    );
+    $expected_accept =~ s/\s+$//;  # trim trailing whitespace/newline
+    if ($response =~ /Sec-WebSocket-Accept:\s*(\S+)/i) {
+        my $got = $1;
+        die "[Nasty] WebSocket accept header mismatch (MITM?)\n"
+            unless $got eq $expected_accept;
+    } else {
+        die "[Nasty] WebSocket response missing Sec-WebSocket-Accept header\n";
+    }
 
     return $sock;
 }
@@ -288,31 +305,37 @@ sub _ws_send_frame {
 sub _ws_recv_frame {
     my ($sock) = @_;
 
-    # Read 2-byte header
-    my $hdr = '';
-    $sock->read($hdr, 2) == 2 or die "[Nasty] WebSocket read error: connection closed\n";
-    my ($b0, $b1) = unpack('CC', $hdr);
+    for my $attempt (1..50) {
+        # Read 2-byte header
+        my $hdr = '';
+        $sock->read($hdr, 2) == 2 or die "[Nasty] WebSocket read error: connection closed\n";
+        my ($b0, $b1) = unpack('CC', $hdr);
 
-    my $opcode = $b0 & 0x0f;
-    my $len    = $b1 & 0x7f;
+        my $opcode = $b0 & 0x0f;
+        my $len    = $b1 & 0x7f;
 
-    if ($len == 126) {
-        my $ext; $sock->read($ext, 2); $len = unpack('n', $ext);
-    } elsif ($len == 127) {
-        my $ext; $sock->read($ext, 8); (undef, $len) = unpack('NN', $ext);
+        if ($len == 126) {
+            my $ext; $sock->read($ext, 2); $len = unpack('n', $ext);
+        } elsif ($len == 127) {
+            my $ext; $sock->read($ext, 8);
+            my ($hi, $lo) = unpack('NN', $ext);
+            $len = ($hi << 32) | $lo;
+        }
+
+        # Server frames are unmasked
+        my $payload = '';
+        while (length($payload) < $len) {
+            my $chunk;
+            my $n = $sock->read($chunk, $len - length($payload));
+            die "[Nasty] WebSocket read error\n" unless $n;
+            $payload .= $chunk;
+        }
+
+        return $payload if $opcode == 1;   # text frame
+        die "[Nasty] WebSocket connection closed by server\n" if $opcode == 8;  # close
+        # opcode 0, 9, 10 (continuation, ping, pong) — skip and read next frame
     }
-
-    # Server frames are unmasked
-    my $payload = '';
-    while (length($payload) < $len) {
-        my $chunk;
-        my $n = $sock->read($chunk, $len - length($payload));
-        die "[Nasty] WebSocket read error\n" unless $n;
-        $payload .= $chunk;
-    }
-
-    return $payload if $opcode == 1;  # text frame
-    return _ws_recv_frame($sock);     # skip ping/pong/continuation
+    die "[Nasty] WebSocket: too many non-text frames\n";
 }
 
 sub _api_call {
@@ -335,7 +358,7 @@ sub _api_call {
 
     my $conn = eval { _ws_ensure_connected($scfg) };
     if ($@) {
-        die "[Nasty] connection to $host failed: $@";
+        die $@;
     }
 
     my $id      = $conn->{id}++;
@@ -361,6 +384,9 @@ sub _api_call {
     }
 
     my $response = $JSON->decode($raw);
+    if (defined $response->{id} && $response->{id} != $id) {
+        die "[Nasty] $method: response ID mismatch (got $response->{id}, expected $id)\n";
+    }
     if (my $err = $response->{error}) {
         die "[Nasty] $method failed: " . ($err->{message} // 'unknown error') . "\n";
     }
