@@ -14,12 +14,12 @@ exposed over iSCSI or NVMe-oF (NVMe/TCP).
 
 ## Installation
 
-See [wiki/Installation.md](wiki/Installation.md).
+See [Installation.md](Installation.md).
 
 ## Configuration
 
-See [wiki/Configuration.md](wiki/Configuration.md).
+See [Configuration.md](Configuration.md).
 
 ## Changelog
 
-See [wiki/Changelog.md](wiki/Changelog.md).
+See [Changelog.md](Changelog.md).

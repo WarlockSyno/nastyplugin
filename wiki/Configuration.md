@@ -10,6 +10,7 @@ All keys use the `nasty_` prefix in `/etc/pve/storage.cfg`.
 | `nasty_api_token` | API token (Bearer auth) |
 | `nasty_filesystem` | bcachefs filesystem name (e.g. `tank`) |
 | `nasty_subvolume_prefix` | Parent subvolume for all VM disks (e.g. `pve`) |
+| `nasty_transport_mode` | Transport protocol: `iscsi` (default) or `nvme-tcp` |
 
 ## Transport: iSCSI (default)
 
