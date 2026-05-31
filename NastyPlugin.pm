@@ -896,5 +896,77 @@ sub deactivate_volume {
     return 1;
 }
 
+sub volume_snapshot {
+    my ($class, $scfg, $storeid, $volname, $snap) = @_;
+
+    _log($scfg, 1, "[Nasty] volume_snapshot: $volname @ $snap");
+
+    _api_call($scfg, 'snapshot.create', {
+        filesystem => $scfg->{nasty_filesystem},
+        subvolume  => $volname,
+        name       => $snap,
+    });
+
+    return undef;
+}
+
+sub volume_snapshot_delete {
+    my ($class, $scfg, $storeid, $volname, $snap, $running) = @_;
+
+    my $fs = $scfg->{nasty_filesystem};
+
+    _log($scfg, 1, "[Nasty] volume_snapshot_delete: $volname @ $snap");
+
+    # 1. Clean up any stale snap-clone for this snapshot
+    my $clone_name = _snapclone_volname($scfg, $volname, $snap);
+    my $existing = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $clone_name }) };
+    if ($existing) {
+        _log($scfg, 1, "[Nasty] cleaning up stale snap-clone: $clone_name");
+        if (my $bd = $existing->{block_device}) {
+            eval { _remove_from_share($scfg, $bd) };
+            warn "[Nasty] snap-clone cleanup share removal warning: $@" if $@;
+        }
+        eval { _api_call($scfg, 'subvolume.delete', { filesystem => $fs, name => $clone_name }) };
+        warn "[Nasty] snap-clone cleanup delete warning: $@" if $@;
+    }
+
+    # 2. Delete the snapshot
+    _api_call($scfg, 'snapshot.delete', {
+        filesystem => $fs,
+        subvolume  => $volname,
+        name       => $snap,
+    });
+
+    return undef;
+}
+
+sub volume_snapshot_rollback {
+    my ($class, $scfg, $storeid, $volname, $snap) = @_;
+    die "[Nasty] snapshot rollback is not supported\n";
+    # TODO: revisit when Nasty adds native snapshot.restore API support
+}
+
+sub volume_snapshot_info {
+    my ($class, $scfg, $storeid, $volname, $snap) = @_;
+
+    my $snapshots = _api_call($scfg, 'snapshot.list', {
+        filesystem => $scfg->{nasty_filesystem},
+    });
+
+    for my $s (@$snapshots) {
+        next unless $s->{subvolume} eq $volname && $s->{name} eq $snap;
+        return {
+            id      => $snap,
+            vmid    => undef,
+            tag     => $snap,
+            running => 0,
+            ctime   => $s->{created_at} // 0,
+            size    => undef,
+        };
+    }
+
+    return undef;
+}
+
 1;
 
