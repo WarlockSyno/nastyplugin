@@ -46,7 +46,22 @@ my %CACHE_INVALIDATE = (
     'share.nvmeof.remove_namespace' => ['share.nvmeof.list'],
 );
 
-our $VERSION = '0.1.0';
+our $VERSION = '0.1.1';
+
+sub api {
+    my $tested_apiver = 13;
+
+    my $system_apiver = eval { require PVE::Storage; PVE::Storage::APIVER() } // 11;
+    my $system_apiage = eval { PVE::Storage::APIAGE() } // 2;
+
+    if ($system_apiver >= 11 && $system_apiver <= $tested_apiver) {
+        return $system_apiver;
+    }
+    if ($system_apiver - $system_apiage < $tested_apiver) {
+        return $tested_apiver;
+    }
+    return 11;
+}
 
 sub type { return 'nastyplugin'; }
 
@@ -55,7 +70,6 @@ sub plugindata {
         content => [{ images => 1, rootdir => 1 }, { images => 1 }],
         format  => [{ raw => 1 }, 'raw'],
         select_existing => 1,
-        shared => 1,
     };
 }
 
@@ -123,6 +137,7 @@ sub options {
         nodes             => { optional => 1 },
         disable           => { optional => 1 },
         content           => { optional => 1 },
+        shared            => { optional => 1 },
         nasty_api_host        => { fixed => 1 },
         nasty_api_port        => { optional => 1 },
         nasty_api_scheme      => { optional => 1 },
@@ -164,12 +179,12 @@ sub check_config {
 sub parse_volname {
     my ($class, $volname) = @_;
 
-    # pve/vm-100-disk-0
-    # pve/vm-100-state-snapname
-    # pve/pve-snapclone-vm-100-disk-0-snapname
-    if ($volname =~ m!^([^/]+)/vm-(\d+)-(\S+)$!) {
+    # pve-vm-100-disk-0
+    # pve-vm-100-state-snapname
+    # pve-pve-snapclone-vm-100-disk-0-snapname
+    if ($volname =~ m!^([^-]+(?:-[^-]+)*)-vm-(\d+)-(\S+)$!) {
         my ($prefix, $vmid, $rest) = ($1, $2, $3);
-        my $name = "$prefix/vm-$vmid-$rest";
+        my $name = "$prefix-vm-$vmid-$rest";
         return ('images', $name, $vmid, undef, undef, 0, 'raw');
     }
 
@@ -182,6 +197,22 @@ sub _log {
     return if $level > $configured;
     my $priority = $level == 0 ? 'err' : $level == 1 ? 'info' : 'debug';
     syslog($priority, '%s', $msg);
+}
+
+sub _quiet_system {
+    my (@cmd) = @_;
+
+    open(my $oldout, '>&', \*STDOUT) or die "[Nasty] failed to dup stdout: $!\n";
+    open(my $olderr, '>&', \*STDERR) or die "[Nasty] failed to dup stderr: $!\n";
+    open(STDOUT, '>', '/dev/null') or die "[Nasty] failed to redirect stdout: $!\n";
+    open(STDERR, '>', '/dev/null') or die "[Nasty] failed to redirect stderr: $!\n";
+
+    my $ret = system(@cmd);
+
+    open(STDOUT, '>&', $oldout) or die "[Nasty] failed to restore stdout: $!\n";
+    open(STDERR, '>&', $olderr) or die "[Nasty] failed to restore stderr: $!\n";
+
+    return $ret;
 }
 
 sub _ws_key {
@@ -275,6 +306,8 @@ sub _ws_ensure_connected {
     }
 
     my $sock = _ws_connect($scfg);
+    # Drain the server's initial auth broadcast before any RPC calls
+    _ws_recv_frame($sock);
     $WS_CONN{$key} = { sock => $sock, id => 1 };
     return $WS_CONN{$key};
 }
@@ -378,16 +411,23 @@ sub _api_call {
         die "[Nasty] $method failed: send error: $@\n";
     }
 
-    my $raw = eval { _ws_recv_frame($conn->{sock}) };
-    if ($@) {
-        delete $WS_CONN{"$host:$port"};
-        die "[Nasty] $method failed: recv error: $@\n";
+    my $response;
+    for my $attempt (1..50) {
+        my $raw = eval { _ws_recv_frame($conn->{sock}) };
+        if ($@) {
+            delete $WS_CONN{"$host:$port"};
+            die "[Nasty] $method failed: recv error: $@\n";
+        }
+
+        $response = $JSON->decode($raw);
+        next if !defined $response->{id};
+        next if $response->{id} != $id;
+        last;
     }
 
-    my $response = $JSON->decode($raw);
-    if (defined $response->{id} && $response->{id} != $id) {
-        die "[Nasty] $method: response ID mismatch (got $response->{id}, expected $id)\n";
-    }
+    die "[Nasty] $method: response ID mismatch or missing response (expected $id)\n"
+        unless $response && defined $response->{id} && $response->{id} == $id;
+
     if (my $err = $response->{error}) {
         die "[Nasty] $method failed: " . ($err->{message} // 'unknown error') . "\n";
     }
@@ -439,9 +479,9 @@ sub _iscsi_login {
     my $iqn  = $scfg->{nasty_iscsi_target};
     my $host = $scfg->{nasty_api_host};
     _log($scfg, 1, "[Nasty] iSCSI login: target=$iqn portal=$host");
-    system('iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $host) == 0
+    _quiet_system('iscsiadm', '-m', 'discovery', '-t', 'sendtargets', '-p', $host) == 0
         or warn "[Nasty] iSCSI discovery failed (continuing)\n";
-    my $ret = system('iscsiadm', '-m', 'node', '-T', $iqn, '-p', $host, '--login');
+    my $ret = _quiet_system('iscsiadm', '-m', 'node', '-T', $iqn, '-p', $host, '--login');
     my $exit_code = $ret >> 8;
     die "[Nasty] iSCSI login failed for target $iqn (exit $exit_code)\n"
         unless $exit_code == 0 || $exit_code == 15;  # 15 = ISCSI_ERR_SESS_EXISTS
@@ -451,7 +491,7 @@ sub _iscsi_login {
 sub _iscsi_rescan {
     my ($scfg, $lun_id) = @_;
     my $iqn = $scfg->{nasty_iscsi_target};
-    system('iscsiadm', '-m', 'session', '--rescan') == 0
+    _quiet_system('iscsiadm', '-m', 'session', '--rescan') == 0
         or warn "[Nasty] iSCSI rescan returned non-zero (continuing)\n";
     sleep(1);
     # Find device via /dev/disk/by-path
@@ -625,7 +665,7 @@ sub activate_storage {
         _api_call($scfg, 'subvolume.create', {
             filesystem    => $fs,
             name          => $prefix,
-            subvolume_type => 'Filesystem',
+            subvolume_type => 'filesystem',
         });
     }
 
@@ -678,12 +718,12 @@ sub list_images {
     for my $sv (@$subvols) {
         my $name = $sv->{name};
 
-        # Only manage volumes under our prefix
-        next unless $name =~ m!^\Q$prefix\E/vm-(\d+)-!;
+        # Only manage volumes using our prefix
+        next unless $name =~ m!^\Q$prefix\E-vm-(\d+)-!;
         my $svmid = $1;
 
         # Skip snapclones
-        next if $name =~ m!/pve-snapclone-!;
+        next if $name =~ m!^\Q$prefix\E-pve-snapclone-!;
 
         # Filter by vmid if requested
         next if defined $vmid && $svmid != $vmid;
@@ -715,7 +755,7 @@ sub _next_disk_num {
     die "[Nasty] _next_disk_num: subvolume.list failed: $@" if $@;
     my $max = -1;
     for my $sv (@$subvols) {
-        if ($sv->{name} =~ m!^\Q$prefix\E/vm-\Q$vmid\E-disk-(\d+)$!) {
+        if ($sv->{name} =~ m!^\Q$prefix\E-vm-\Q$vmid\E-disk-(\d+)$!) {
             $max = $1 if $1 > $max;
         }
     }
@@ -732,10 +772,10 @@ sub alloc_image {
     my $volname;
     if ($name) {
         # Proxmox passed an explicit name (e.g. for vmstate)
-        $volname = "$prefix/$name";
+        $volname = "$prefix-$name";
     } else {
         my $n = _next_disk_num($scfg, $vmid);
-        $volname = "$prefix/vm-$vmid-disk-$n";
+        $volname = "$prefix-vm-$vmid-disk-$n";
     }
 
     # size is in KB from Proxmox
@@ -747,8 +787,8 @@ sub alloc_image {
     my $sv = _api_call($scfg, 'subvolume.create', {
         filesystem     => $fs,
         name           => $volname,
-        subvolume_type => 'Block',
-        volsize_bytes  => $bytes,
+        subvolume_type => 'block',
+        volsize_bytes  => 0 + $bytes,
     });
 
     my $block_device = $sv->{block_device}
@@ -791,6 +831,7 @@ sub _resolve_dev_path {
     if ($mode eq 'iscsi') {
         my $lun_id = _iscsi_find_lun($scfg, $block_device);
         die "[Nasty] no LUN found for block device $block_device\n" unless defined $lun_id;
+        _iscsi_login($scfg);
         my $dev = _iscsi_rescan($scfg, $lun_id);
         die "[Nasty] device not found for LUN $lun_id after rescan\n" unless $dev;
         return $dev;
@@ -806,9 +847,9 @@ sub _resolve_dev_path {
 sub _snapclone_volname {
     my ($scfg, $volname, $snapname) = @_;
     my $prefix = $scfg->{nasty_subvolume_prefix};
-    # volname is like "pve/vm-100-disk-0", extract disk part
-    (my $diskpart = $volname) =~ s!^\Q$prefix\E/!!;
-    return "$prefix/pve-snapclone-$diskpart-$snapname";
+    # volname is like "pve-vm-100-disk-0", extract disk part
+    (my $diskpart = $volname) =~ s!^\Q$prefix\E-!!;
+    return "$prefix-pve-snapclone-$diskpart-$snapname";
 }
 
 sub path {
@@ -955,25 +996,23 @@ sub volume_snapshot_rollback {
 }
 
 sub volume_snapshot_info {
-    my ($class, $scfg, $storeid, $volname, $snap) = @_;
+    my ($class, $scfg, $storeid, $volname) = @_;
 
     my $snapshots = _api_call($scfg, 'snapshot.list', {
         filesystem => $scfg->{nasty_filesystem},
     });
 
+    my $res = {};
     for my $s (@$snapshots) {
-        next unless $s->{subvolume} eq $volname && $s->{name} eq $snap;
-        return {
-            id      => $snap,
-            vmid    => undef,
-            tag     => $snap,
-            running => 0,
-            ctime   => $s->{created_at} // 0,
-            size    => undef,
+        next unless $s->{subvolume} eq $volname;
+        my $name = $s->{name} // next;
+        $res->{$name} = {
+            id        => $name,
+            timestamp => $s->{created_at} // 0,
         };
     }
 
-    return undef;
+    return $res;
 }
 
 sub volume_size_info {
@@ -996,7 +1035,7 @@ sub volume_resize {
     _api_call($scfg, 'subvolume.resize', {
         filesystem    => $scfg->{nasty_filesystem},
         name          => $volname,
-        volsize_bytes => $size,
+        volsize_bytes => 0 + $size,
     });
 
     return undef;

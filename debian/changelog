@@ -1,3 +1,16 @@
+nasty-proxmox-plugin (0.1.1) bookworm; urgency=medium
+
+  * Add Proxmox storage API compatibility declaration for PVE 8/9 loading.
+  * Fix WebSocket response handling for auth broadcasts and event frames.
+  * Use flat NASty block subvolume names accepted by the appliance API.
+  * Encode allocate and resize byte counts as JSON numbers.
+  * Return snapshot info in the shape expected by current Proxmox wrappers.
+  * Ensure iSCSI login before path resolution and suppress iscsiadm stdout.
+  * Update the full-function test script for current Proxmox CLI behavior.
+  * Expand the NASty full-function test script to mirror TrueNAS plugin test coverage with NASty-specific checks.
+
+ -- NastyPlugin Maintainers <noreply@github.com>  Sun, 31 May 2026 00:00:00 +0000
+
 nasty-proxmox-plugin (0.1.0) bookworm; urgency=medium
 
   * Initial release.

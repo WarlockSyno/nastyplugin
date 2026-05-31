@@ -3,7 +3,7 @@
 ## Quick Install
 
 ```bash
-dpkg -i nasty-proxmox-plugin_0.1.0_all.deb
+dpkg -i nasty-proxmox-plugin_0.1.1_all.deb
 ```
 
 Then configure storage:
