@@ -701,5 +701,81 @@ sub list_images {
     return \@res;
 }
 
+sub _next_disk_num {
+    my ($scfg, $vmid) = @_;
+    my $fs     = $scfg->{nasty_filesystem};
+    my $prefix = $scfg->{nasty_subvolume_prefix};
+    my $subvols = _api_call($scfg, 'subvolume.list', { filesystem => $fs });
+    my $max = -1;
+    for my $sv (@$subvols) {
+        if ($sv->{name} =~ m!^\Q$prefix\E/vm-\Q$vmid\E-disk-(\d+)$!) {
+            $max = $1 if $1 > $max;
+        }
+    }
+    return $max + 1;
+}
+
+sub alloc_image {
+    my ($class, $storeid, $scfg, $vmid, $fmt, $name, $size) = @_;
+
+    my $fs     = $scfg->{nasty_filesystem};
+    my $prefix = $scfg->{nasty_subvolume_prefix};
+
+    # Derive subvolume name
+    my $volname;
+    if ($name) {
+        # Proxmox passed an explicit name (e.g. for vmstate)
+        $volname = "$prefix/$name";
+    } else {
+        my $n = _next_disk_num($scfg, $vmid);
+        $volname = "$prefix/vm-$vmid-disk-$n";
+    }
+
+    # size is in KB from Proxmox
+    my $bytes = $size * 1024;
+
+    _log($scfg, 1, "[Nasty] alloc_image: $volname ($bytes bytes)");
+
+    # Create Block subvolume on Nasty
+    my $sv = _api_call($scfg, 'subvolume.create', {
+        filesystem     => $fs,
+        name           => $volname,
+        subvolume_type => 'Block',
+        volsize_bytes  => $bytes,
+    });
+
+    my $block_device = $sv->{block_device}
+        or die "[Nasty] subvolume.create returned no block_device for $volname\n";
+
+    # Expose via transport
+    _add_to_share($scfg, $block_device);
+
+    return $volname;
+}
+
+sub free_image {
+    my ($class, $storeid, $scfg, $volname, $isBase, $format) = @_;
+
+    my $fs = $scfg->{nasty_filesystem};
+
+    _log($scfg, 1, "[Nasty] free_image: $volname");
+
+    # Get current block_device
+    my $sv = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $volname }) };
+    if ($@) {
+        warn "[Nasty] free_image: subvolume.get failed for $volname: $@";
+        return undef;
+    }
+
+    if (my $block_device = $sv->{block_device}) {
+        eval { _remove_from_share($scfg, $block_device) };
+        warn "[Nasty] free_image: remove_from_share warning: $@" if $@;
+    }
+
+    _api_call($scfg, 'subvolume.delete', { filesystem => $fs, name => $volname });
+
+    return undef;
+}
+
 1;
 
