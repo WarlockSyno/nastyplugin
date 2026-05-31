@@ -454,7 +454,7 @@ sub _iscsi_rescan {
     # Find device via /dev/disk/by-path
     my $by_path = "/dev/disk/by-path";
     opendir(my $dh, $by_path) or return undef;
-    my @links = grep { /iscsi-$iqn.*lun-$lun_id$/ } readdir($dh);
+    my @links = grep { /iscsi-\Q$iqn\E.*lun-\Q$lun_id\E$/ } readdir($dh);
     closedir($dh);
     return undef unless @links;
     return readlink("$by_path/$links[0]")
@@ -521,14 +521,30 @@ sub _nvme_connect {
 
 sub _nvme_rescan {
     my ($scfg, $device_path) = @_;
-    # device_path is a loop device like /dev/loop3
-    # After nvme connect, the namespace appears as /dev/nvmeXnY
-    # Find it by scanning nvme subsystem controllers
     sleep(1);
-    my @devs = glob('/dev/nvme*n*');
+
+    # Use nvme list to find the namespace backed by $device_path
+    my $json_out = qx(nvme list -o json 2>/dev/null) // '';
+    if ($json_out) {
+        eval {
+            my $data = $JSON->decode($json_out);
+            for my $dev (@{ $data->{Devices} // [] }) {
+                my $node = $dev->{DevicePath} // '';
+                # Check sysfs backing device for this namespace
+                (my $nsdev = $node) =~ s!/dev/!!;
+                my $backing = "/sys/class/block/$nsdev/device";
+                if (-e $backing) {
+                    my $resolved = readlink($backing) // '';
+                    return $node if $resolved =~ /\Q$device_path\E/ || $node eq $device_path;
+                }
+            }
+        };
+    }
+
+    # Fallback: scan /dev/nvme*n* via sysfs
+    my @devs = sort glob('/dev/nvme*n*');
     for my $dev (@devs) {
         next unless $dev =~ m!/dev/nvme\d+n\d+$!;
-        # Check if the backing device matches via sysfs
         my $nsdev = $dev;
         $nsdev =~ s!/dev/!!;
         my $sysfs = "/sys/class/block/$nsdev/device";
@@ -547,12 +563,14 @@ sub _add_to_share {
             target_id    => $tid,
             backstore_path => $block_device,
         });
-    } else {
+    } elsif ($mode eq 'nvme-tcp') {
         my $sid = _nvme_subsystem_id($scfg);
         return _api_call($scfg, 'share.nvmeof.add_namespace', {
             subsystem_id => $sid,
             device_path  => $block_device,
         });
+    } else {
+        die "[Nasty] unknown transport mode '$mode'\n";
     }
 }
 
@@ -567,7 +585,7 @@ sub _remove_from_share {
             target_id => $tid,
             lun_id    => $lun_id,
         });
-    } else {
+    } elsif ($mode eq 'nvme-tcp') {
         my $nsid = _nvme_find_ns($scfg, $block_device);
         return unless defined $nsid;
         my $sid = _nvme_subsystem_id($scfg);
@@ -575,6 +593,8 @@ sub _remove_from_share {
             subsystem_id => $sid,
             nsid         => $nsid,
         });
+    } else {
+        die "[Nasty] unknown transport mode '$mode'\n";
     }
 }
 
