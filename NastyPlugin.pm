@@ -705,7 +705,8 @@ sub _next_disk_num {
     my ($scfg, $vmid) = @_;
     my $fs     = $scfg->{nasty_filesystem};
     my $prefix = $scfg->{nasty_subvolume_prefix};
-    my $subvols = _api_call($scfg, 'subvolume.list', { filesystem => $fs });
+    my $subvols = eval { _api_call($scfg, 'subvolume.list', { filesystem => $fs }) };
+    die "[Nasty] _next_disk_num: subvolume.list failed: $@" if $@;
     my $max = -1;
     for my $sv (@$subvols) {
         if ($sv->{name} =~ m!^\Q$prefix\E/vm-\Q$vmid\E-disk-(\d+)$!) {
