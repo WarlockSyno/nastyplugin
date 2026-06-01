@@ -1,3 +1,20 @@
+nasty-proxmox-plugin (0.1.3) bookworm; urgency=medium
+
+  * Update storage API compatibility to PVE API level 14.
+  * Fix NVMe device discovery: use NSID-based sysfs lookup instead of device path matching.
+  * Fix taint-mode crash in _iscsi_remove_scsi_device: untaint readlink() result before use in open().
+  * Fix WebSocket stale-connection failure after forked child exits: retry _api_call once on connection errors.
+  * Fix NVMe idempotent activation by detecting an already-live controller before nvme connect.
+  * Fix NVMe live migration by passing a deterministic hostid derived from the NASty hostnqn.
+
+ -- NastyPlugin Maintainers <noreply@github.com>  Sun, 01 Jun 2026 00:00:00 +0000
+
+nasty-proxmox-plugin (0.1.2) bookworm; urgency=medium
+
+  * Fix iSCSI ghost device leak: remove initiator-side SCSI disk node via sysfs before removing LUN from NASty target.
+
+ -- NastyPlugin Maintainers <noreply@github.com>  Sun, 01 Jun 2026 00:00:00 +0000
+
 nasty-proxmox-plugin (0.1.1) bookworm; urgency=medium
 
   * Add Proxmox storage API compatibility declaration for PVE 8/9 loading.
@@ -8,6 +25,11 @@ nasty-proxmox-plugin (0.1.1) bookworm; urgency=medium
   * Ensure iSCSI login before path resolution and suppress iscsiadm stdout.
   * Update the full-function test script for current Proxmox CLI behavior.
   * Expand the NASty full-function test script to mirror TrueNAS plugin test coverage with NASty-specific checks.
+  * Optimize full-function test pre-flight cleanup to avoid silent per-VMID storage scans.
+  * Fix full-function test failure accounting so error logging cannot break shell returns.
+  * Fix volume_size_info scalar-context return for Proxmox 9 disk attachment and resize validation.
+  * Advertise snapshot/clone/copy feature support to Proxmox and untaint device paths for LXC rootfs formatting.
+  * Fix full-function test NASty API helper JSON parameter handling and single-phase reruns.
 
  -- NastyPlugin Maintainers <noreply@github.com>  Sun, 31 May 2026 00:00:00 +0000
 

@@ -4,7 +4,7 @@
 # Function inventory intentionally matches dev-truenas-plugin-full-function-test.sh.
 # Run directly on a Proxmox VE node with the NASty plugin installed.
 
-set -euo pipefail
+set -uo pipefail
 
 if [[ $# -lt 2 ]]; then
     echo "Error: Missing required arguments"
@@ -237,7 +237,8 @@ tn_api_call() {
     local host="$1"
     local api_key="$2"
     local method="$3"
-    local params="${4:-{}}"
+    local params="${4:-}"
+    [[ -z "$params" ]] && params='{}'
     local api_insecure="${5:-0}"
     local api_port="${NASTY_API_PORT:-443}"
     local api_scheme="${NASTY_API_SCHEME:-wss}"
@@ -294,14 +295,18 @@ check_apiver_mismatch() {
 parse_vm_node_from_json() {
     local cluster_json="$1"
     local vmid="$2"
+    local type_filter="${3:-}"
     printf '%s' "$cluster_json" | perl -MJSON::PP -e '
-        my ($vmid) = @ARGV;
+        my ($vmid, $type_filter) = @ARGV;
         my $json = do { local $/; <STDIN> };
         my $data = eval { decode_json($json) } || [];
         for my $item (@$data) {
-            if (($item->{vmid} // "") eq $vmid) { print $item->{node} // ""; last; }
+            next if (($item->{vmid} // "") ne $vmid);
+            next if length($type_filter) && (($item->{type} // "") ne $type_filter);
+            print $item->{node} // "";
+            last;
         }
-    ' "$vmid" 2>/dev/null || true
+    ' "$vmid" "$type_filter" 2>/dev/null || true
 }
 
 wait_for_vm_deletion() {
@@ -403,24 +408,110 @@ free_orphaned_disks_for_vmid() {
 cleanup_test_vms() {
     local vmid_start="$1"
     local vmid_end="$2"
-    log_info "Pre-flight cleanup: VMID range $vmid_start-$vmid_end"
+    log_info "Pre-flight cleanup: checking VMID range $vmid_start-$vmid_end (cluster-wide)"
+    local cleaned=0
+
+    log_info "Querying cluster resources..."
     local cluster_vms
     cluster_vms=$(timeout 30 pvesh get /cluster/resources --type vm --output-format json 2>/dev/null || echo "[]")
+
+    declare -A vm_nodes=()
+    local vm_count=0
     for vmid in $(seq "$vmid_start" "$vmid_end"); do
         local node
-        node=$(parse_vm_node_from_json "$cluster_vms" "$vmid")
+        node=$(parse_vm_node_from_json "$cluster_vms" "$vmid" qemu)
         if [[ -n "$node" ]]; then
-            log_warning "Deleting VM $vmid on node $node"
-            timeout 60 pvesh delete "/nodes/$node/qemu/$vmid" >/dev/null 2>&1 || true
-        fi
-        if pct status "$vmid" >/dev/null 2>&1; then
-            log_warning "Destroying LXC $vmid"
-            destroy_lxc "$vmid"
-        else
-            free_orphaned_disks_for_vmid "$vmid"
+            vm_nodes[$vmid]="$node"
+            vm_count=$((vm_count + 1))
         fi
     done
-    wait_for_vm_deletion "$vmid_start" "$vmid_end" 3 || true
+
+    log_info "Querying storage for all disks..."
+    local all_disks
+    all_disks=$(timeout 30 pvesm list "$STORAGE_ID" 2>/dev/null | tail -n +2 || echo "")
+
+    if [[ $vm_count -gt 0 ]]; then
+        log_info "Found $vm_count VMs to clean up"
+        for vmid in "${!vm_nodes[@]}"; do
+            local node="${vm_nodes[$vmid]}"
+            log_warning "Deleting VM $vmid on node $node"
+            timeout 60 pvesh delete "/nodes/$node/qemu/$vmid" >/dev/null 2>&1 || true
+            free_orphaned_disks_for_vmid "$vmid"
+            cleaned=$((cleaned + 1))
+            sleep "$DISK_ATTACH_WAIT"
+        done
+    else
+        log_success "No VMs found in range"
+    fi
+
+    declare -A lxc_nodes=()
+    local container_count=0
+    for vmid in $(seq "$vmid_start" "$vmid_end"); do
+        local node
+        node=$(parse_vm_node_from_json "$cluster_vms" "$vmid" lxc)
+        if [[ -n "$node" ]]; then
+            lxc_nodes[$vmid]="$node"
+            container_count=$((container_count + 1))
+        fi
+    done
+
+    if [[ $container_count -gt 0 ]]; then
+        log_info "Found $container_count LXC containers to clean up"
+        for vmid in "${!lxc_nodes[@]}"; do
+            log_warning "Destroying LXC $vmid"
+            destroy_lxc "$vmid"
+            cleaned=$((cleaned + 1))
+            sleep "$DISK_ATTACH_WAIT"
+        done
+    else
+        log_success "No LXC containers found in range"
+    fi
+
+    if [[ -n "$all_disks" ]]; then
+        log_info "Checking for orphaned disks..."
+        declare -A orphaned_vms=()
+        while read -r line; do
+            local volid
+            volid=$(echo "$line" | awk '{print $1}')
+            [[ -z "$volid" || "$volid" == *"pve-plugin-weight"* ]] && continue
+            for vmid in $(seq "$vmid_start" "$vmid_end"); do
+                if [[ "$volid" == *"vm-${vmid}-"* ]]; then
+                    orphaned_vms[$vmid]=1
+                    break
+                fi
+            done
+        done <<< "$all_disks"
+
+        for vmid in "${!orphaned_vms[@]}"; do
+            log_warning "Found orphaned disk(s) for VM $vmid, attempting cleanup"
+            local vm_node
+            vm_node=$(parse_vm_node_from_json "$cluster_vms" "$vmid")
+            if [[ -n "$vm_node" ]]; then
+                log_warning "Deleting VM $vmid on node $vm_node"
+                timeout 60 pvesh delete "/nodes/$vm_node/qemu/$vmid" >/dev/null 2>&1 || true
+                free_orphaned_disks_for_vmid "$vmid"
+            else
+                log_warning "VM $vmid config not found, removing disks directly"
+                while read -r line; do
+                    local volid
+                    volid=$(echo "$line" | awk '{print $1}')
+                    if [[ "$volid" == *"vm-${vmid}-"* && "$volid" != *"pve-plugin-weight"* ]]; then
+                        log_warning "Freeing orphaned disk for VM $vmid: $volid"
+                        timeout 60 pvesm free "$volid" >/dev/null 2>&1 || true
+                    fi
+                done <<< "$all_disks"
+            fi
+            cleaned=$((cleaned + 1))
+            sleep "$DISK_ATTACH_WAIT"
+        done
+    fi
+
+    if [[ $cleaned -gt 0 ]]; then
+        log_success "Cleaned up $cleaned orphaned resources"
+        wait_for_vm_deletion "$vmid_start" "$vmid_end" 3 || true
+    else
+        log_success "No orphaned resources found"
+    fi
 }
 
 extract_first_volid() {
@@ -479,13 +570,13 @@ test_disk_allocation() {
     local start_time expected_bytes volid actual_size duration
     start_time=$(date +%s)
     expected_bytes=$((size_gb * 1024 * 1024 * 1024))
-    qm create "$vmid" -name "test-alloc-${size_gb}gb" -memory 512 >/dev/null 2>&1 || return $(record_fail "$test_name" "Failed to create VM")
+    qm create "$vmid" -name "test-alloc-${size_gb}gb" -memory 512 >/dev/null 2>&1 || { record_fail "$test_name" "Failed to create VM"; return 1; }
     volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" -vmid "$vmid" -filename "vm-${vmid}-disk-0" -size "${size_gb}G" --output-format=json 2>/dev/null | extract_first_volid)
-    [[ -n "$volid" ]] || return $(record_fail "$test_name" "Failed to allocate disk")
+    [[ -n "$volid" ]] || { record_fail "$test_name" "Failed to allocate disk"; return 1; }
     sleep "$ALLOCATION_WAIT"
     actual_size=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | awk -v vol="$volid" '$1 == vol {print $4; exit}')
     duration=$(($(date +%s) - start_time))
-    [[ "$actual_size" == "$expected_bytes" ]] || return $(record_fail "$test_name" "Size mismatch: expected $expected_bytes, got ${actual_size:-missing}")
+    [[ "$actual_size" == "$expected_bytes" ]] || { record_fail "$test_name" "Size mismatch: expected $expected_bytes, got ${actual_size:-missing}"; return 1; }
     log_success "Disk allocated: $volid ($actual_size bytes) in ${duration}s"
     track_timing "disk_allocation" "$duration"
     record_pass "$test_name"
@@ -498,19 +589,28 @@ test_truenas_size_verification() {
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     local volid pvesm_size api_size config api_host api_port api_scheme api_token api_verify_ssl filesystem prefix transport iscsi_target nvme_subsystem nvme_hostnqn volname api_response
     volid=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | awk -v pat="vm-${vmid}-disk-0" '$1 ~ pat {print $1; exit}')
-    [[ -n "$volid" ]] || return $(record_fail "$test_name" "No matching disk found")
+    [[ -n "$volid" ]] || { record_fail "$test_name" "No matching disk found"; return 1; }
     pvesm_size=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | awk -v vol="$volid" '$1 == vol {print $4; exit}')
     config=$(get_storage_config "$STORAGE_ID")
     IFS='|' read -r api_host api_port api_scheme api_token api_verify_ssl filesystem prefix transport iscsi_target nvme_subsystem nvme_hostnqn <<< "$config"
     export NASTY_API_PORT="$api_port" NASTY_API_SCHEME="$api_scheme" NASTY_FILESYSTEM="$filesystem" NASTY_PREFIX="$prefix" NASTY_TRANSPORT="$transport" NASTY_ISCSI_TARGET="$iscsi_target" NASTY_NVME_SUBSYSTEM="$nvme_subsystem" NASTY_NVME_HOSTNQN="$nvme_hostnqn"
     volname="${volid#*:}"
     if [[ -n "$api_host" && -n "$api_token" && -n "$filesystem" ]]; then
-        api_response=$(tn_api_call "$api_host" "$api_token" "subvolume.get" "{\"filesystem\":\"$filesystem\",\"name\":\"$volname\"}" "$api_verify_ssl" 2>/dev/null || echo "{}")
-        api_size=$(printf '%s' "$api_response" | perl -MJSON::PP -e 'my $d=eval{decode_json(do{local $/;<STDIN>})}||{}; print $d->{volsize_bytes}//0' 2>/dev/null || echo 0)
-        [[ "$api_size" == "$pvesm_size" ]] || return $(record_fail "$test_name" "NASty API size mismatch: Proxmox=$pvesm_size, NASty=$api_size")
+        local json_params="{\"filesystem\":\"$filesystem\",\"name\":\"$volname\"}"
+        log_verbose "Size verify: filesystem=[$filesystem] volname=[$volname] json=[$json_params]" "DEBUG"
+        local api_stderr=/tmp/nasty-api-stderr-$$.txt
+        api_response=$(tn_api_call "$api_host" "$api_token" "subvolume.get" "$json_params" "$api_verify_ssl" 2>"$api_stderr") || true
+        if [[ ! -s "$api_stderr" ]]; then
+            api_size=$(printf '%s' "$api_response" | perl -MJSON::PP -e 'my $d=eval{decode_json(do{local $/;<STDIN>})}||{}; print $d->{volsize_bytes}//0' 2>/dev/null || echo 0)
+        else
+            log_warning "NASty API error: $(cat "$api_stderr")"
+            api_size=0
+        fi
+        rm -f "$api_stderr"
+        [[ "$api_size" == "$pvesm_size" ]] || { record_fail "$test_name" "NASty API size mismatch: Proxmox=$pvesm_size, NASty=$api_size"; return 1; }
         log_success "Sizes match: Proxmox=$pvesm_size, NASty=$api_size"
     else
-        [[ -n "$pvesm_size" && "$pvesm_size" != "0" ]] || return $(record_fail "$test_name" "Unable to read size from Proxmox")
+        [[ -n "$pvesm_size" && "$pvesm_size" != "0" ]] || { record_fail "$test_name" "Unable to read size from Proxmox"; return 1; }
         log_warning "NASty API config unavailable; verified Proxmox-reported size only ($pvesm_size)"
     fi
     record_pass "$test_name"
@@ -524,16 +624,16 @@ test_disk_deletion() {
     local start_time disks_before volid disk_name duration
     start_time=$(date +%s)
     disks_before=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | tail -n +2 || true)
-    [[ -n "$disks_before" ]] || return $(record_fail "$test_name" "No disks found")
+    [[ -n "$disks_before" ]] || { record_fail "$test_name" "No disks found"; return 1; }
     volid=$(echo "$disks_before" | awk '{print $1; exit}')
     disk_name="${volid#*:}"
     qm set "$vmid" -scsi0 "$volid" >/dev/null 2>&1 || true
     delete_vm_and_disks "$vmid"
     wait_for_vm_deletion "$vmid" "$vmid" 5 || true
     if pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | tail -n +2 | grep -q .; then
-        return $(record_fail "$test_name" "Disks remain after VM deletion")
+        { record_fail "$test_name" "Disks remain after VM deletion"; return 1; }
     fi
-    verify_truenas_zvol_deleted "$vmid" "$disk_name" || return $(record_fail "$test_name" "Backend volume still present: $disk_name")
+    verify_truenas_zvol_deleted "$vmid" "$disk_name" || { record_fail "$test_name" "Backend volume still present: $disk_name"; return 1; }
     duration=$(($(date +%s) - start_time))
     log_success "VM and disk deleted (${duration}s)"
     track_timing "disk_deletion" "$duration"
@@ -546,7 +646,7 @@ test_create_base_vm_for_clone() {
     local test_name="Create base VM for cloning tests (VMID $vmid)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     local volid
-    volid=$(create_vm_with_disk "$vmid" "test-clone-base" "10G") || return $(record_fail "$test_name" "Failed to create base VM with disk")
+    volid=$(create_vm_with_disk "$vmid" "test-clone-base" "10G") || { record_fail "$test_name" "Failed to create base VM with disk"; return 1; }
     log_success "Base VM created with disk $volid"
     record_pass "$test_name"
 }
@@ -557,8 +657,8 @@ test_create_snapshot() {
     local test_name="Create snapshot (VMID $vmid)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     local snapshot_name="test-snapshot-$(date +%s)"
-    qm snapshot "$vmid" "$snapshot_name" --description "Test snapshot" >/dev/null 2>&1 || return $(record_fail "$test_name" "Failed to create snapshot")
-    qm listsnapshot "$vmid" 2>/dev/null | grep -q "$snapshot_name" || return $(record_fail "$test_name" "Snapshot not found in list")
+    qm snapshot "$vmid" "$snapshot_name" --description "Test snapshot" >/dev/null 2>&1 || { record_fail "$test_name" "Failed to create snapshot"; return 1; }
+    qm listsnapshot "$vmid" 2>/dev/null | grep -q "$snapshot_name" || { record_fail "$test_name" "Snapshot not found in list"; return 1; }
     echo "$snapshot_name" > "/tmp/test-snapshot-name-${vmid}.txt"
     log_success "Snapshot '$snapshot_name' created"
     record_pass "$test_name"
@@ -571,10 +671,10 @@ test_full_clone() {
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     local start_time duration
     start_time=$(date +%s)
-    qm clone "$base_vmid" "$clone_vmid" --name "test-full-clone" --full --storage "$STORAGE_ID" >/dev/null 2>&1 || return $(record_fail "$test_name" "Clone failed")
+    qm clone "$base_vmid" "$clone_vmid" --name "test-full-clone" --full --storage "$STORAGE_ID" >/dev/null 2>&1 || { record_fail "$test_name" "Clone failed"; return 1; }
     sleep "$API_SETTLE_TIME"
-    pvesh get "/nodes/$NODE/qemu/$clone_vmid" >/dev/null 2>&1 || return $(record_fail "$test_name" "Clone VM missing")
-    pvesm list "$STORAGE_ID" --vmid "$clone_vmid" 2>/dev/null | tail -n +2 | grep -q . || return $(record_fail "$test_name" "Clone disk missing")
+    pvesh get "/nodes/$NODE/qemu/$clone_vmid" >/dev/null 2>&1 || { record_fail "$test_name" "Clone VM missing"; return 1; }
+    pvesm list "$STORAGE_ID" --vmid "$clone_vmid" 2>/dev/null | tail -n +2 | grep -q . || { record_fail "$test_name" "Clone disk missing"; return 1; }
     duration=$(($(date +%s) - start_time))
     track_timing "clone_operation" "$duration"
     log_success "Full clone created (${duration}s)"
@@ -587,12 +687,12 @@ test_delete_snapshot() {
     local test_name="Delete snapshot (VMID $vmid)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     local snapshot_name
-    [[ -f "/tmp/test-snapshot-name-${vmid}.txt" ]] || return $(record_fail "$test_name" "Snapshot name not found")
+    [[ -f "/tmp/test-snapshot-name-${vmid}.txt" ]] || { record_fail "$test_name" "Snapshot name not found"; return 1; }
     snapshot_name=$(cat "/tmp/test-snapshot-name-${vmid}.txt")
-    qm delsnapshot "$vmid" "$snapshot_name" >/dev/null 2>&1 || return $(record_fail "$test_name" "Failed to delete snapshot")
+    qm delsnapshot "$vmid" "$snapshot_name" >/dev/null 2>&1 || { record_fail "$test_name" "Failed to delete snapshot"; return 1; }
     sleep "$API_SETTLE_TIME"
     if qm listsnapshot "$vmid" 2>/dev/null | grep -q "$snapshot_name"; then
-        return $(record_fail "$test_name" "Snapshot still exists after deletion")
+        { record_fail "$test_name" "Snapshot still exists after deletion"; return 1; }
     fi
     rm -f "/tmp/test-snapshot-name-${vmid}.txt"
     log_success "Snapshot deleted"
@@ -604,13 +704,13 @@ test_disk_resize() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     local test_name="Disk Resize (10GB → 20GB)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
-    create_vm_with_disk "$vmid" "test-resize-${vmid}" "10G" >/dev/null || return $(record_fail "$test_name" "Failed to create VM with disk")
-    qm resize "$vmid" scsi0 "20G" >/dev/null 2>&1 || return $(record_fail "$test_name" "Resize command failed")
+    create_vm_with_disk "$vmid" "test-resize-${vmid}" "10G" >/dev/null || { record_fail "$test_name" "Failed to create VM with disk"; return 1; }
+    qm resize "$vmid" scsi0 "20G" >/dev/null 2>&1 || { record_fail "$test_name" "Resize command failed"; return 1; }
     sleep "$API_SETTLE_TIME"
     local new_size expected
     new_size=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | tail -n +2 | awk '{print $4; exit}')
     expected=21474836480
-    [[ "$new_size" == "$expected" ]] || return $(record_fail "$test_name" "Size mismatch: got $new_size, expected $expected")
+    [[ "$new_size" == "$expected" ]] || { record_fail "$test_name" "Size mismatch: got $new_size, expected $expected"; return 1; }
     delete_vm_and_disks "$vmid"
     log_success "Disk resize verified"
     record_pass "$test_name"
@@ -634,7 +734,7 @@ test_concurrent_operations() {
     rm -rf "$error_dir"
     for i in {0..9}; do delete_vm_and_disks "$((base_vmid + i))"; done
     wait_for_vm_deletion "$base_vmid" "$((base_vmid + 9))" 5 || true
-    [[ $succeeded -gt 0 ]] || return $(record_fail "$test_name" "All concurrent operations failed")
+    [[ $succeeded -gt 0 ]] || { record_fail "$test_name" "All concurrent operations failed"; return 1; }
     track_timing "concurrent_capacity" "$succeeded"
     log_success "Concurrent operations succeeded for $succeeded/10 VMs"
     record_pass "$test_name"
@@ -648,7 +748,7 @@ test_performance() {
     local start_ms end_ms elapsed vmid
     vmid=$base_vmid
     start_ms=$(date +%s%3N)
-    create_vm_with_disk "$vmid" "perf-test-5g" "5G" >/dev/null || return $(record_fail "$test_name" "5GB allocation failed")
+    create_vm_with_disk "$vmid" "perf-test-5g" "5G" >/dev/null || { record_fail "$test_name" "5GB allocation failed"; return 1; }
     end_ms=$(date +%s%3N)
     elapsed=$((end_ms - start_ms))
     track_timing "perf_alloc_5g_ms" "$elapsed"
@@ -662,16 +762,16 @@ test_multiple_disks() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     local test_name="Multiple Disks (3 disks per VM)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
-    qm create "$vmid" -name "test-multi-disk-${vmid}" -memory 512 >/dev/null 2>&1 || return $(record_fail "$test_name" "VM creation failed")
+    qm create "$vmid" -name "test-multi-disk-${vmid}" -memory 512 >/dev/null 2>&1 || { record_fail "$test_name" "VM creation failed"; return 1; }
     for i in {0..2}; do
         local volid
         volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" -vmid "$vmid" -filename "vm-${vmid}-disk-${i}" -size "5G" --output-format=json 2>/dev/null | extract_first_volid)
-        [[ -n "$volid" ]] || return $(record_fail "$test_name" "Disk $i allocation failed")
-        qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1 || return $(record_fail "$test_name" "Disk $i attachment failed")
+        [[ -n "$volid" ]] || { record_fail "$test_name" "Disk $i allocation failed"; return 1; }
+        qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1 || { record_fail "$test_name" "Disk $i attachment failed"; return 1; }
     done
     local count
     count=$(pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | tail -n +2 | wc -l)
-    [[ $count -eq 3 ]] || return $(record_fail "$test_name" "Expected 3 disks, found $count")
+    [[ $count -eq 3 ]] || { record_fail "$test_name" "Expected 3 disks, found $count"; return 1; }
     delete_vm_and_disks "$vmid"
     log_success "Multiple disks verified"
     record_pass "$test_name"
@@ -682,14 +782,14 @@ test_efi_vm_creation() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     local test_name="EFI VM Creation and Boot Configuration"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
-    qm create "$vmid" -name "test-efi-${vmid}" -memory 512 -bios ovmf >/dev/null 2>&1 || return $(record_fail "$test_name" "EFI VM creation failed")
+    qm create "$vmid" -name "test-efi-${vmid}" -memory 512 -bios ovmf >/dev/null 2>&1 || { record_fail "$test_name" "EFI VM creation failed"; return 1; }
     local efi_volid data_volid
     efi_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" -vmid "$vmid" -filename "vm-${vmid}-disk-0" -size "1M" --output-format=json 2>/dev/null | extract_first_volid)
-    qm set "$vmid" -efidisk0 "$efi_volid" >/dev/null 2>&1 || return $(record_fail "$test_name" "EFI disk configuration failed")
+    qm set "$vmid" -efidisk0 "$efi_volid" >/dev/null 2>&1 || { record_fail "$test_name" "EFI disk configuration failed"; return 1; }
     data_volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" -vmid "$vmid" -filename "vm-${vmid}-disk-1" -size "2G" --output-format=json 2>/dev/null | extract_first_volid)
-    qm set "$vmid" -scsi0 "$data_volid" >/dev/null 2>&1 || return $(record_fail "$test_name" "Data disk attachment failed")
-    qm config "$vmid" | grep -q '^bios: ovmf' || return $(record_fail "$test_name" "BIOS not OVMF")
-    timeout 30 qm start "$vmid" >/dev/null 2>&1 || return $(record_fail "$test_name" "VM start failed")
+    qm set "$vmid" -scsi0 "$data_volid" >/dev/null 2>&1 || { record_fail "$test_name" "Data disk attachment failed"; return 1; }
+    qm config "$vmid" | grep -q '^bios: ovmf' || { record_fail "$test_name" "BIOS not OVMF"; return 1; }
+    timeout 30 qm start "$vmid" >/dev/null 2>&1 || { record_fail "$test_name" "VM start failed"; return 1; }
     qm stop "$vmid" --timeout 10 >/dev/null 2>&1 || true
     delete_vm_and_disks "$vmid"
     track_timing "efi_vm_creation" 1
@@ -727,7 +827,7 @@ test_live_migration() {
     local test_name="Live Migration (Online)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     if [[ $IS_CLUSTER -ne 1 ]]; then record_skip_as_pass "$test_name" "not in cluster"; return 0; fi
-    migrate_round_trip "$vmid" online || return $(record_fail "$test_name" "Live migration failed")
+    migrate_round_trip "$vmid" online || { record_fail "$test_name" "Live migration failed"; return 1; }
     track_timing "live_migration" 1
     record_pass "$test_name"
 }
@@ -738,7 +838,7 @@ test_offline_migration() {
     local test_name="Offline Migration"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     if [[ $IS_CLUSTER -ne 1 ]]; then record_skip_as_pass "$test_name" "not in cluster"; return 0; fi
-    migrate_round_trip "$vmid" || return $(record_fail "$test_name" "Offline migration failed")
+    migrate_round_trip "$vmid" || { record_fail "$test_name" "Offline migration failed"; return 1; }
     track_timing "offline_migration" 1
     record_pass "$test_name"
 }
@@ -749,9 +849,9 @@ test_online_backup() {
     local test_name="Online Backup (Running VM)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     [[ -n "$BACKUP_STORE" ]] || { record_skip_as_pass "$test_name" "no backup store"; return 0; }
-    create_vm_with_disk "$vmid" "test-backup-online" "2G" >/dev/null || return $(record_fail "$test_name" "VM creation failed")
-    qm start "$vmid" >/dev/null 2>&1 || return $(record_fail "$test_name" "VM start failed")
-    vzdump "$vmid" --mode snapshot --storage "$BACKUP_STORE" >/dev/null 2>&1 || return $(record_fail "$test_name" "Backup failed")
+    create_vm_with_disk "$vmid" "test-backup-online" "2G" >/dev/null || { record_fail "$test_name" "VM creation failed"; return 1; }
+    qm start "$vmid" >/dev/null 2>&1 || { record_fail "$test_name" "VM start failed"; return 1; }
+    vzdump "$vmid" --mode snapshot --storage "$BACKUP_STORE" >/dev/null 2>&1 || { record_fail "$test_name" "Backup failed"; return 1; }
     qm stop "$vmid" >/dev/null 2>&1 || true
     delete_vm_and_disks "$vmid"
     track_timing "online_backup" 1
@@ -764,8 +864,8 @@ test_offline_backup() {
     local test_name="Offline Backup (Stopped VM)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     [[ -n "$BACKUP_STORE" ]] || { record_skip_as_pass "$test_name" "no backup store"; return 0; }
-    create_vm_with_disk "$vmid" "test-backup-offline" "2G" >/dev/null || return $(record_fail "$test_name" "VM creation failed")
-    vzdump "$vmid" --mode stop --storage "$BACKUP_STORE" >/dev/null 2>&1 || return $(record_fail "$test_name" "Backup failed")
+    create_vm_with_disk "$vmid" "test-backup-offline" "2G" >/dev/null || { record_fail "$test_name" "VM creation failed"; return 1; }
+    vzdump "$vmid" --mode stop --storage "$BACKUP_STORE" >/dev/null 2>&1 || { record_fail "$test_name" "Backup failed"; return 1; }
     delete_vm_and_disks "$vmid"
     track_timing "offline_backup" 1
     record_pass "$test_name"
@@ -777,9 +877,9 @@ test_cross_node_clone_online() {
     local test_name="Cross-Node Clone (Online)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     [[ $IS_CLUSTER -eq 1 ]] || { record_skip_as_pass "$test_name" "not in cluster"; return 0; }
-    create_vm_with_disk "$vmid" "test-xnode-clone-online" "2G" >/dev/null || return $(record_fail "$test_name" "source create failed")
+    create_vm_with_disk "$vmid" "test-xnode-clone-online" "2G" >/dev/null || { record_fail "$test_name" "source create failed"; return 1; }
     qm start "$vmid" >/dev/null 2>&1 || true
-    qm clone "$vmid" "$clone_vmid" --name "test-xnode-clone-online-dst" --full --storage "$STORAGE_ID" --target "$TARGET_NODE" >/dev/null 2>&1 || return $(record_fail "$test_name" "clone failed")
+    qm clone "$vmid" "$clone_vmid" --name "test-xnode-clone-online-dst" --full --storage "$STORAGE_ID" --target "$TARGET_NODE" >/dev/null 2>&1 || { record_fail "$test_name" "clone failed"; return 1; }
     qm stop "$vmid" >/dev/null 2>&1 || true
     delete_vm_and_disks "$vmid"
     delete_vm_and_disks "$clone_vmid" "$TARGET_NODE"
@@ -792,8 +892,8 @@ test_cross_node_clone_offline() {
     local test_name="Cross-Node Clone (Offline)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     [[ $IS_CLUSTER -eq 1 ]] || { record_skip_as_pass "$test_name" "not in cluster"; return 0; }
-    create_vm_with_disk "$vmid" "test-xnode-clone-offline" "2G" >/dev/null || return $(record_fail "$test_name" "source create failed")
-    qm clone "$vmid" "$clone_vmid" --name "test-xnode-clone-offline-dst" --full --storage "$STORAGE_ID" --target "$TARGET_NODE" >/dev/null 2>&1 || return $(record_fail "$test_name" "clone failed")
+    create_vm_with_disk "$vmid" "test-xnode-clone-offline" "2G" >/dev/null || { record_fail "$test_name" "source create failed"; return 1; }
+    qm clone "$vmid" "$clone_vmid" --name "test-xnode-clone-offline-dst" --full --storage "$STORAGE_ID" --target "$TARGET_NODE" >/dev/null 2>&1 || { record_fail "$test_name" "clone failed"; return 1; }
     delete_vm_and_disks "$vmid"
     delete_vm_and_disks "$clone_vmid" "$TARGET_NODE"
     record_pass "$test_name"
@@ -810,7 +910,7 @@ test_rapid_create_delete_stress() {
         create_vm_with_disk "$vmid" "test-stress-$i" "1G" >/dev/null || failed=$((failed + 1))
         delete_vm_and_disks "$vmid"
     done
-    [[ $failed -eq 0 ]] || return $(record_fail "$test_name" "$failed iterations failed")
+    [[ $failed -eq 0 ]] || { record_fail "$test_name" "$failed iterations failed"; return 1; }
     track_timing "rapid_create_delete" 5
     record_pass "$test_name"
 }
@@ -820,7 +920,7 @@ test_storage_exhaustion() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     local test_name="Storage Quota/Space Exhaustion"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
-    pvesm status --storage "$STORAGE_ID" >/dev/null 2>&1 || return $(record_fail "$test_name" "Storage status failed")
+    pvesm status --storage "$STORAGE_ID" >/dev/null 2>&1 || { record_fail "$test_name" "Storage status failed"; return 1; }
     record_skip_as_pass "$test_name" "destructive exhaustion allocation intentionally not run"
 }
 
@@ -830,7 +930,7 @@ test_invalid_api_requests() {
     local test_name="Invalid/Malformed API Requests"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     if pvesm path "$STORAGE_ID:does-not-exist" >/dev/null 2>&1; then
-        return $(record_fail "$test_name" "Invalid volume path unexpectedly succeeded")
+        { record_fail "$test_name" "Invalid volume path unexpectedly succeeded"; return 1; }
     fi
     record_pass "$test_name"
 }
@@ -840,7 +940,7 @@ test_interrupted_operations() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     local test_name="Interrupted Operations"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
-    create_vm_with_disk "$vmid" "test-interrupted" "2G" >/dev/null || return $(record_fail "$test_name" "setup allocation failed")
+    create_vm_with_disk "$vmid" "test-interrupted" "2G" >/dev/null || { record_fail "$test_name" "setup allocation failed"; return 1; }
     delete_vm_and_disks "$vmid"
     record_skip_as_pass "$test_name" "non-deterministic process interruption not forced; cleanup path verified"
 }
@@ -850,7 +950,7 @@ test_large_disk_operations() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     local test_name="Large Disk Operations"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
-    create_vm_with_disk "$vmid" "test-large-disk" "100G" >/dev/null || return $(record_fail "$test_name" "100GB allocation failed")
+    create_vm_with_disk "$vmid" "test-large-disk" "100G" >/dev/null || { record_fail "$test_name" "100GB allocation failed"; return 1; }
     delete_vm_and_disks "$vmid"
     track_timing "large_disk" 1
     record_pass "$test_name"
@@ -864,10 +964,10 @@ test_transport_mode_verification() {
     local config api_host api_port api_scheme api_token api_verify_ssl filesystem prefix transport iscsi_target nvme_subsystem nvme_hostnqn volid path
     config=$(get_storage_config "$STORAGE_ID")
     IFS='|' read -r api_host api_port api_scheme api_token api_verify_ssl filesystem prefix transport iscsi_target nvme_subsystem nvme_hostnqn <<< "$config"
-    [[ "$transport" == "iscsi" || "$transport" == "nvme-tcp" ]] || return $(record_fail "$test_name" "Invalid nasty_transport_mode: $transport")
-    volid=$(create_vm_with_disk "$vmid" "test-transport" "1G") || return $(record_fail "$test_name" "allocation failed")
+    [[ "$transport" == "iscsi" || "$transport" == "nvme-tcp" ]] || { record_fail "$test_name" "Invalid nasty_transport_mode: $transport"; return 1; }
+    volid=$(create_vm_with_disk "$vmid" "test-transport" "1G") || { record_fail "$test_name" "allocation failed"; return 1; }
     path=$(pvesm path "$volid" 2>/dev/null || true)
-    [[ -b "$path" ]] || return $(record_fail "$test_name" "path did not resolve to block device for $transport")
+    [[ -b "$path" ]] || { record_fail "$test_name" "path did not resolve to block device for $transport"; return 1; }
     delete_vm_and_disks "$vmid"
     log_success "Transport $transport resolved $volid to $path"
     record_pass "$test_name"
@@ -896,7 +996,9 @@ test_api_rate_limiting() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     local test_name="API Rate Limiting"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
-    for _ in {1..10}; do pvesm status --storage "$STORAGE_ID" >/dev/null 2>&1 || return $(record_fail "$test_name" "status request failed under repetition"); done
+    for _ in {1..10}; do
+        pvesm status --storage "$STORAGE_ID" >/dev/null 2>&1 || { record_fail "$test_name" "status request failed under repetition"; return 1; }
+    done
     record_pass "$test_name"
 }
 
@@ -905,10 +1007,10 @@ test_disk_hotswap() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     local test_name="Disk Hotswap"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
-    create_vm_with_disk "$vmid" "test-hotswap" "1G" >/dev/null || return $(record_fail "$test_name" "initial disk failed")
+    create_vm_with_disk "$vmid" "test-hotswap" "1G" >/dev/null || { record_fail "$test_name" "initial disk failed"; return 1; }
     local volid
     volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" -vmid "$vmid" -filename "vm-${vmid}-disk-1" -size "1G" --output-format=json 2>/dev/null | extract_first_volid)
-    qm set "$vmid" -scsi1 "$volid" >/dev/null 2>&1 || return $(record_fail "$test_name" "hot-added disk attach failed")
+    qm set "$vmid" -scsi1 "$volid" >/dev/null 2>&1 || { record_fail "$test_name" "hot-added disk attach failed"; return 1; }
     delete_vm_and_disks "$vmid"
     record_pass "$test_name"
 }
@@ -920,7 +1022,7 @@ test_multi_pool_operations() {
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     local count
     count=$(grep -c '^nastyplugin:' /etc/pve/storage.cfg || true)
-    [[ $count -ge 1 ]] || return $(record_fail "$test_name" "No NASty storage entries found")
+    [[ $count -ge 1 ]] || { record_fail "$test_name" "No NASty storage entries found"; return 1; }
     record_skip_as_pass "$test_name" "single configured NASty storage is sufficient for this environment (found $count)"
 }
 
@@ -929,7 +1031,7 @@ test_dataset_property_inheritance() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     local test_name="Dataset Property Inheritance"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
-    create_vm_with_disk "$vmid" "test-properties" "1G" >/dev/null || return $(record_fail "$test_name" "allocation failed")
+    create_vm_with_disk "$vmid" "test-properties" "1G" >/dev/null || { record_fail "$test_name" "allocation failed"; return 1; }
     delete_vm_and_disks "$vmid"
     record_skip_as_pass "$test_name" "NASty bcachefs property inheritance has no TrueNAS zvol property equivalent"
 }
@@ -955,8 +1057,8 @@ test_concurrent_alloc_free_contention() {
     local test_name="Concurrent Alloc+Free Lock Contention"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     local vmid_free=$((VMID_START + 34)) vmid_alloc=$((VMID_START + 35)) free_volid err=/tmp/contention-$$
-    free_volid=$(create_vm_with_disk "$vmid_free" "test-contention-free" "1G") || return $(record_fail "$test_name" "free target setup failed")
-    qm create "$vmid_alloc" -name "test-contention-alloc" -memory 512 >/dev/null 2>&1 || return $(record_fail "$test_name" "alloc target setup failed")
+    free_volid=$(create_vm_with_disk "$vmid_free" "test-contention-free" "1G") || { record_fail "$test_name" "free target setup failed"; return 1; }
+    qm create "$vmid_alloc" -name "test-contention-alloc" -memory 512 >/dev/null 2>&1 || { record_fail "$test_name" "alloc target setup failed"; return 1; }
     mkdir -p "$err"
     (pvesm free "$free_volid" >/dev/null 2>&1 && echo OK > "$err/free") &
     (pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" -vmid "$vmid_alloc" -filename "vm-${vmid_alloc}-disk-0" -size "1G" --output-format=json >/dev/null 2>&1 && echo OK > "$err/alloc") &
@@ -966,7 +1068,7 @@ test_concurrent_alloc_free_contention() {
     [[ "$(cat "$err/alloc" 2>/dev/null || true)" == OK ]] && ok=$((ok + 1))
     rm -rf "$err"
     delete_vm_and_disks "$vmid_free"; delete_vm_and_disks "$vmid_alloc"
-    [[ $ok -ge 1 ]] || return $(record_fail "$test_name" "both concurrent operations failed")
+    [[ $ok -ge 1 ]] || { record_fail "$test_name" "both concurrent operations failed"; return 1; }
     track_timing "contention_success_count" "$ok"
     record_pass "$test_name"
 }
@@ -977,14 +1079,14 @@ test_multi_disk_sequential_timing() {
     local test_name="Multi-Disk Sequential Timing (4 disks)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     local vmid=$((VMID_START + 36))
-    qm create "$vmid" -name "test-multidisk-seq" -memory 512 >/dev/null 2>&1 || return $(record_fail "$test_name" "VM creation failed")
+    qm create "$vmid" -name "test-multidisk-seq" -memory 512 >/dev/null 2>&1 || { record_fail "$test_name" "VM creation failed"; return 1; }
     for i in 0 1 2 3; do
         local start end volid
         start=$(date +%s%3N)
         volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" -vmid "$vmid" -filename "vm-${vmid}-disk-${i}" -size "1G" --output-format=json 2>/dev/null | extract_first_volid)
         end=$(date +%s%3N)
-        [[ -n "$volid" ]] || return $(record_fail "$test_name" "disk $i allocation failed")
-        qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1 || return $(record_fail "$test_name" "disk $i attach failed")
+        [[ -n "$volid" ]] || { record_fail "$test_name" "disk $i allocation failed"; return 1; }
+        qm set "$vmid" -scsi${i} "$volid" >/dev/null 2>&1 || { record_fail "$test_name" "disk $i attach failed"; return 1; }
         track_timing "multidisk_seq_disk${i}" "$((end - start))"
     done
     delete_vm_and_disks "$vmid"
@@ -1007,8 +1109,8 @@ test_concurrent_clone_operations() {
     local test_name="Concurrent Clone Operations (2 simultaneous clones)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     local src_a=$((VMID_START + 40)) src_b=$((VMID_START + 41)) dst_a=$((VMID_START + 42)) dst_b=$((VMID_START + 43)) err=/tmp/clone-$$
-    create_vm_with_disk "$src_a" "test-clone-src-a" "1G" >/dev/null || return $(record_fail "$test_name" "source A failed")
-    create_vm_with_disk "$src_b" "test-clone-src-b" "1G" >/dev/null || return $(record_fail "$test_name" "source B failed")
+    create_vm_with_disk "$src_a" "test-clone-src-a" "1G" >/dev/null || { record_fail "$test_name" "source A failed"; return 1; }
+    create_vm_with_disk "$src_b" "test-clone-src-b" "1G" >/dev/null || { record_fail "$test_name" "source B failed"; return 1; }
     mkdir -p "$err"
     (qm clone "$src_a" "$dst_a" --name test-clone-dst-a --full --storage "$STORAGE_ID" >/dev/null 2>&1 && echo OK > "$err/a") &
     (qm clone "$src_b" "$dst_b" --name test-clone-dst-b --full --storage "$STORAGE_ID" >/dev/null 2>&1 && echo OK > "$err/b") &
@@ -1018,7 +1120,7 @@ test_concurrent_clone_operations() {
     [[ "$(cat "$err/b" 2>/dev/null || true)" == OK ]] && ok=$((ok + 1))
     rm -rf "$err"
     for v in "$src_a" "$src_b" "$dst_a" "$dst_b"; do delete_vm_and_disks "$v"; done
-    [[ $ok -ge 1 ]] || return $(record_fail "$test_name" "both clones failed")
+    [[ $ok -ge 1 ]] || { record_fail "$test_name" "both clones failed"; return 1; }
     track_timing "concurrent_clone_success_count" "$ok"
     record_pass "$test_name"
 }
@@ -1048,10 +1150,10 @@ test_lxc_create_start_stop() {
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     [[ $IS_ROOTDIR -eq 1 ]] || { record_skip_as_pass "$test_name" "rootdir not enabled"; return 0; }
     destroy_lxc "$vmid"
-    pct create "$vmid" "$LXC_TEMPLATE" --rootfs "$STORAGE_ID:4" --hostname test-lxc-create --memory 512 --swap 0 >/dev/null 2>&1 || return $(record_fail "$test_name" "create failed")
-    pct start "$vmid" >/dev/null 2>&1 || return $(record_fail "$test_name" "start failed")
+    pct create "$vmid" "$LXC_TEMPLATE" --rootfs "$STORAGE_ID:4" --hostname test-lxc-create --memory 512 --swap 0 >/dev/null 2>&1 || { record_fail "$test_name" "create failed"; return 1; }
+    pct start "$vmid" >/dev/null 2>&1 || { record_fail "$test_name" "start failed"; return 1; }
     sleep 3
-    pct stop "$vmid" >/dev/null 2>&1 || return $(record_fail "$test_name" "stop failed")
+    pct stop "$vmid" >/dev/null 2>&1 || { record_fail "$test_name" "stop failed"; return 1; }
     destroy_lxc "$vmid"
     record_pass "$test_name"
 }
@@ -1072,8 +1174,8 @@ test_lxc_clone() {
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     [[ $IS_ROOTDIR -eq 1 ]] || { record_skip_as_pass "$test_name" "rootdir not enabled"; return 0; }
     destroy_lxc "$base_vmid"; destroy_lxc "$clone_vmid"
-    pct create "$base_vmid" "$LXC_TEMPLATE" --rootfs "$STORAGE_ID:4" --hostname test-lxc-base --memory 512 --swap 0 >/dev/null 2>&1 || return $(record_fail "$test_name" "base create failed")
-    pct clone "$base_vmid" "$clone_vmid" --hostname test-lxc-clone >/dev/null 2>&1 || return $(record_fail "$test_name" "clone failed")
+    pct create "$base_vmid" "$LXC_TEMPLATE" --rootfs "$STORAGE_ID:4" --hostname test-lxc-base --memory 512 --swap 0 >/dev/null 2>&1 || { record_fail "$test_name" "base create failed"; return 1; }
+    pct clone "$base_vmid" "$clone_vmid" --hostname test-lxc-clone >/dev/null 2>&1 || { record_fail "$test_name" "clone failed"; return 1; }
     destroy_lxc "$base_vmid"; destroy_lxc "$clone_vmid"
     record_pass "$test_name"
 }
@@ -1085,8 +1187,8 @@ test_lxc_resize() {
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     [[ $IS_ROOTDIR -eq 1 ]] || { record_skip_as_pass "$test_name" "rootdir not enabled"; return 0; }
     destroy_lxc "$vmid"
-    pct create "$vmid" "$LXC_TEMPLATE" --rootfs "$STORAGE_ID:4" --hostname test-lxc-resize --memory 512 --swap 0 >/dev/null 2>&1 || return $(record_fail "$test_name" "create failed")
-    pct resize "$vmid" rootfs +4G >/dev/null 2>&1 || return $(record_fail "$test_name" "resize failed")
+    pct create "$vmid" "$LXC_TEMPLATE" --rootfs "$STORAGE_ID:4" --hostname test-lxc-resize --memory 512 --swap 0 >/dev/null 2>&1 || { record_fail "$test_name" "create failed"; return 1; }
+    pct resize "$vmid" rootfs +4G >/dev/null 2>&1 || { record_fail "$test_name" "resize failed"; return 1; }
     destroy_lxc "$vmid"
     record_pass "$test_name"
 }
@@ -1107,8 +1209,8 @@ test_lxc_multi_mountpoint() {
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     [[ $IS_ROOTDIR -eq 1 ]] || { record_skip_as_pass "$test_name" "rootdir not enabled"; return 0; }
     destroy_lxc "$vmid"
-    pct create "$vmid" "$LXC_TEMPLATE" --rootfs "$STORAGE_ID:4" --hostname test-lxc-mp --memory 512 --swap 0 >/dev/null 2>&1 || return $(record_fail "$test_name" "create failed")
-    pct set "$vmid" -mp0 "$STORAGE_ID:2,mp=/data" >/dev/null 2>&1 || return $(record_fail "$test_name" "mountpoint attach failed")
+    pct create "$vmid" "$LXC_TEMPLATE" --rootfs "$STORAGE_ID:4" --hostname test-lxc-mp --memory 512 --swap 0 >/dev/null 2>&1 || { record_fail "$test_name" "create failed"; return 1; }
+    pct set "$vmid" -mp0 "$STORAGE_ID:2,mp=/data" >/dev/null 2>&1 || { record_fail "$test_name" "mountpoint attach failed"; return 1; }
     destroy_lxc "$vmid"
     record_pass "$test_name"
 }
@@ -1121,7 +1223,7 @@ test_lxc_stress() {
     [[ $IS_ROOTDIR -eq 1 ]] || { record_skip_as_pass "$test_name" "rootdir not enabled"; return 0; }
     for i in {0..4}; do
         local vmid=$((base_vmid + i))
-        pct create "$vmid" "$LXC_TEMPLATE" --rootfs "$STORAGE_ID:2" --hostname "test-lxc-stress-$i" --memory 256 --swap 0 >/dev/null 2>&1 || return $(record_fail "$test_name" "create $vmid failed")
+        pct create "$vmid" "$LXC_TEMPLATE" --rootfs "$STORAGE_ID:2" --hostname "test-lxc-stress-$i" --memory 256 --swap 0 >/dev/null 2>&1 || { record_fail "$test_name" "create $vmid failed"; return 1; }
         destroy_lxc "$vmid"
     done
     record_pass "$test_name"
@@ -1198,8 +1300,10 @@ main() {
 
     local vmid test_num=1 clone_vmid
 
-    run_phase_header "PHASE 1: Pre-flight Cleanup"
-    cleanup_test_vms "$VMID_START" "$VMID_END"
+    if [[ $START_PHASE -le 1 ]]; then
+        run_phase_header "PHASE 1: Pre-flight Cleanup"
+        cleanup_test_vms "$VMID_START" "$VMID_END"
+    fi
     check_stop_phase 1
 
     if [[ $START_PHASE -le 2 ]]; then run_phase_header "PHASE 2: Disk Allocation Tests"; vmid=$VMID_START; for size in "${TEST_SIZES[@]}"; do test_disk_allocation "$size" "$vmid" "$test_num"; vmid=$((vmid+1)); test_num=$((test_num+1)); done; fi; check_stop_phase 2

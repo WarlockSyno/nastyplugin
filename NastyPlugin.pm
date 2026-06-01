@@ -10,7 +10,7 @@ use IO::Select;
 use JSON::XS;
 use MIME::Base64;
 use Sys::Syslog qw(openlog syslog);
-use Digest::SHA qw(sha1);
+use Digest::SHA qw(sha1 sha1_hex);
 use POSIX qw(floor);
 
 openlog('nastyplugin', 'pid', 'daemon');
@@ -46,10 +46,10 @@ my %CACHE_INVALIDATE = (
     'share.nvmeof.remove_namespace' => ['share.nvmeof.list'],
 );
 
-our $VERSION = '0.1.1';
+our $VERSION = '0.1.3';
 
 sub api {
-    my $tested_apiver = 13;
+    my $tested_apiver = 14;
 
     my $system_apiver = eval { require PVE::Storage; PVE::Storage::APIVER() } // 11;
     my $system_apiage = eval { PVE::Storage::APIAGE() } // 2;
@@ -197,6 +197,12 @@ sub _log {
     return if $level > $configured;
     my $priority = $level == 0 ? 'err' : $level == 1 ? 'info' : 'debug';
     syslog($priority, '%s', $msg);
+}
+
+sub _untaint_abs_path {
+    my ($path) = @_;
+    die "[Nasty] invalid device path\n" unless defined($path) && $path =~ m!^(/[-A-Za-z0-9_./:@+=]+)$!;
+    return $1;
 }
 
 sub _quiet_system {
@@ -390,64 +396,81 @@ sub _api_call {
         }
     }
 
-    my $conn = eval { _ws_ensure_connected($scfg) };
-    if ($@) {
-        die $@;
-    }
+    # Retry once on connection errors (e.g., stale socket after forked child exits)
+    my $last_err;
+    for my $retry (1..2) {
+        my $conn = eval { _ws_ensure_connected($scfg) };
+        if ($@) {
+            $last_err = $@;
+            next;
+        }
 
-    my $id      = $conn->{id}++;
-    my $request = $JSON->encode({
-        jsonrpc => '2.0',
-        id      => $id,
-        method  => $method,
-        params  => $params,
-    });
+        my $id      = $conn->{id}++;
+        my $request = $JSON->encode({
+            jsonrpc => '2.0',
+            id      => $id,
+            method  => $method,
+            params  => $params,
+        });
 
-    _log($scfg, 2, "[Nasty] -> $method");
+        _log($scfg, 2, "[Nasty] -> $method params=" . ($JSON->encode($params)));
 
-    eval { _ws_send_frame($conn->{sock}, $request) };
-    if ($@) {
-        delete $WS_CONN{"$host:$port"};
-        die "[Nasty] $method failed: send error: $@\n";
-    }
-
-    my $response;
-    for my $attempt (1..50) {
-        my $raw = eval { _ws_recv_frame($conn->{sock}) };
+        my $send_err;
+        eval { _ws_send_frame($conn->{sock}, $request) };
         if ($@) {
             delete $WS_CONN{"$host:$port"};
-            die "[Nasty] $method failed: recv error: $@\n";
+            $last_err = "[Nasty] $method failed: send error: $@\n";
+            next;
         }
 
-        $response = $JSON->decode($raw);
-        next if !defined $response->{id};
-        next if $response->{id} != $id;
-        last;
-    }
+        my $response;
+        my $recv_err;
+        for my $attempt (1..50) {
+            my $raw = eval { _ws_recv_frame($conn->{sock}) };
+            if ($@) {
+                delete $WS_CONN{"$host:$port"};
+                $recv_err = $@;
+                last;
+            }
 
-    die "[Nasty] $method: response ID mismatch or missing response (expected $id)\n"
-        unless $response && defined $response->{id} && $response->{id} == $id;
-
-    if (my $err = $response->{error}) {
-        die "[Nasty] $method failed: " . ($err->{message} // 'unknown error') . "\n";
-    }
-
-    my $result = $response->{result};
-
-    # Cache read-only responses
-    if (exists $CACHE_TTL{$method}) {
-        my $ckey = "$host:$method";
-        $API_CACHE{$ckey} = { result => $result, expires => time() + $CACHE_TTL{$method} };
-    }
-
-    # Invalidate related cache keys on writes
-    if (my $inv = $CACHE_INVALIDATE{$method}) {
-        for my $k (@$inv) {
-            delete $API_CACHE{"$host:$k"};
+            _log($scfg, 2, "[Nasty] <- raw=$raw");
+            $response = $JSON->decode($raw);
+            next if !defined $response->{id};
+            next if $response->{id} != $id;
+            last;
         }
+
+        if ($recv_err) {
+            $last_err = "[Nasty] $method failed: recv error: $recv_err\n";
+            next;  # retry
+        }
+
+        die "[Nasty] $method: response ID mismatch or missing response (expected $id)\n"
+            unless $response && defined $response->{id} && $response->{id} == $id;
+
+        if (my $err = $response->{error}) {
+            die "[Nasty] $method failed: " . ($err->{message} // 'unknown error') . "\n";
+        }
+
+        my $result = $response->{result};
+
+        # Cache read-only responses
+        if (exists $CACHE_TTL{$method}) {
+            my $ckey = "$host:$method";
+            $API_CACHE{$ckey} = { result => $result, expires => time() + $CACHE_TTL{$method} };
+        }
+
+        # Invalidate related cache keys on writes
+        if (my $inv = $CACHE_INVALIDATE{$method}) {
+            for my $k (@$inv) {
+                delete $API_CACHE{"$host:$k"};
+            }
+        }
+
+        return $result;
     }
 
-    return $result;
+    die $last_err // "[Nasty] $method: failed after retries\n";
 }
 
 # Returns lun_id or undef if not found.
@@ -531,6 +554,32 @@ sub _nvme_subsystem_id {
     die "[Nasty] NVMe-oF subsystem '$target_name' not found on Nasty\n";
 }
 
+sub _nvme_find_ctrl_idx {
+    my ($target_nqn) = @_;
+
+    for my $ctl_dir (glob('/sys/class/nvme-fabrics/ctl/nvme*')) {
+        my $nqn_file = "$ctl_dir/subsysnqn";
+        next unless -f $nqn_file;
+        open(my $fh, '<', $nqn_file) or next;
+        my $nqn = do { local $/; <$fh> };
+        close($fh);
+        chomp $nqn;
+        next unless $nqn eq $target_nqn || $nqn =~ /\Q$target_nqn\E/;
+        my ($ctrl_idx) = ($ctl_dir =~ m!/nvme(\d+)$!);
+        return $ctrl_idx if defined $ctrl_idx;
+    }
+
+    return undef;
+}
+
+sub _nvme_hostid_for_hostnqn {
+    my ($hostnqn) = @_;
+    my $hex = sha1_hex('nastyplugin:' . ($hostnqn // ''));
+    substr($hex, 12, 1) = '5';
+    substr($hex, 16, 1) = sprintf('%x', (hex(substr($hex, 16, 1)) & 0x3) | 0x8);
+    return join('-', substr($hex, 0, 8), substr($hex, 8, 4), substr($hex, 12, 4), substr($hex, 16, 4), substr($hex, 20, 12));
+}
+
 sub _nvme_connect {
     my ($scfg) = @_;
     my $subsystems = _api_call($scfg, 'share.nvmeof.list');
@@ -541,6 +590,8 @@ sub _nvme_connect {
     die "[Nasty] NVMe-oF subsystem '$target_name' not found\n" unless $subsys;
 
     my $nqn  = $subsys->{nqn};
+    return 1 if defined _nvme_find_ctrl_idx($nqn);
+
     my $host = $scfg->{nasty_api_host};
     my $port = 4420;
     if (my $p = $subsys->{ports} && $subsys->{ports}[0]) {
@@ -555,47 +606,32 @@ sub _nvme_connect {
         close $fh;
     }
 
+    my $hostid = _nvme_hostid_for_hostnqn($hostnqn);
+
     _log($scfg, 1, "[Nasty] NVMe connect: nqn=$nqn host=$host:$port");
     my $ret = system('nvme', 'connect', '-t', 'tcp', '-n', $nqn, '-a', $host, '-s', $port,
-                     '--hostnqn', $hostnqn);
-    # nvme connect returns 70 (EALREADY) when controller is already connected; treat as success
+                     '--hostnqn', $hostnqn, '--hostid', $hostid);
     my $exit_code = $ret >> 8;
     die "[Nasty] nvme connect failed for $nqn (exit $exit_code)\n"
         unless $exit_code == 0 || $exit_code == 70;
     sleep(2);
 }
 
-sub _nvme_rescan {
-    my ($scfg, $device_path) = @_;
-    sleep(1);
+# Find the /dev/nvmeXnY path for a given NASty NSID.
+# Locates the NVMe controller connected to our target NQN, then returns
+# /dev/nvme<ctrl>n<nsid> after waiting for udev to expose the block node.
+sub _nvme_find_dev_by_nsid {
+    my ($scfg, $nsid) = @_;
 
-    # Use nvme list to find the namespace backed by $device_path
-    my $json_out = qx(nvme list -o json 2>/dev/null) // '';
-    if ($json_out) {
-        eval {
-            my $data = $JSON->decode($json_out);
-            for my $dev (@{ $data->{Devices} // [] }) {
-                my $node = $dev->{DevicePath} // '';
-                # Check sysfs backing device for this namespace
-                (my $nsdev = $node) =~ s!/dev/!!;
-                my $backing = "/sys/class/block/$nsdev/device";
-                if (-e $backing) {
-                    my $resolved = readlink($backing) // '';
-                    return $node if $resolved =~ /\Q$device_path\E/ || $node eq $device_path;
-                }
-            }
-        };
-    }
+    my $target_nqn = $scfg->{nasty_nvme_subsystem};
+    my $ctrl_idx = _nvme_find_ctrl_idx($target_nqn);
+    return undef unless defined $ctrl_idx;
 
-    # Fallback: scan /dev/nvme*n* via sysfs
-    my @devs = sort glob('/dev/nvme*n*');
-    for my $dev (@devs) {
-        next unless $dev =~ m!/dev/nvme\d+n\d+$!;
-        my $nsdev = $dev;
-        $nsdev =~ s!/dev/!!;
-        my $sysfs = "/sys/class/block/$nsdev/device";
-        next unless -e $sysfs;
-        return $dev;
+    # Wait up to 10s for /dev/nvme<ctrl>n<nsid> to appear
+    my $dev = "/dev/nvme${ctrl_idx}n${nsid}";
+    for my $attempt (1..20) {
+        return $dev if -b $dev;
+        select(undef, undef, undef, 0.5);  # 500ms
     }
     return undef;
 }
@@ -620,12 +656,34 @@ sub _add_to_share {
     }
 }
 
+sub _iscsi_remove_scsi_device {
+    my ($scfg, $lun_id) = @_;
+    my $iqn     = $scfg->{nasty_iscsi_target};
+    my $by_path = "/dev/disk/by-path";
+    opendir(my $dh, $by_path) or return;
+    my @links = grep { /iscsi-\Q$iqn\E.*lun-\Q$lun_id\E$/ } readdir($dh);
+    closedir($dh);
+    for my $link (@links) {
+        my $target = readlink("$by_path/$link") or next;
+        # $target is like ../../sdX — extract device name (untaint for taint mode)
+        my ($dev) = ($target =~ m!([A-Za-z0-9_-]+)$!) or next;
+        my $delete_path = "/sys/block/$dev/device/delete";
+        if (-e $delete_path) {
+            _log($scfg, 2, "[Nasty] removing stale SCSI device $dev (LUN $lun_id)");
+            open(my $fh, '>', $delete_path) or next;
+            print $fh "1\n";
+            close($fh);
+        }
+    }
+}
+
 sub _remove_from_share {
     my ($scfg, $block_device) = @_;
     my $mode = $scfg->{nasty_transport_mode} // 'iscsi';
     if ($mode eq 'iscsi') {
         my $lun_id = _iscsi_find_lun($scfg, $block_device);
         return unless defined $lun_id;
+        _iscsi_remove_scsi_device($scfg, $lun_id);
         my $tid = _iscsi_target_id($scfg);
         _api_call($scfg, 'share.iscsi.remove_lun', {
             target_id => $tid,
@@ -834,11 +892,15 @@ sub _resolve_dev_path {
         _iscsi_login($scfg);
         my $dev = _iscsi_rescan($scfg, $lun_id);
         die "[Nasty] device not found for LUN $lun_id after rescan\n" unless $dev;
-        return $dev;
+        return _untaint_abs_path($dev);
     } elsif ($mode eq 'nvme-tcp') {
-        my $dev = _nvme_rescan($scfg, $block_device);
-        die "[Nasty] NVMe device not found for $block_device after connect\n" unless $dev;
-        return $dev;
+        # Find NSID from the NASty API, then locate /dev/nvme<ctrl>n<nsid>
+        my $nsid = _nvme_find_ns($scfg, $block_device);
+        die "[Nasty] no NVMe namespace found for block device $block_device\n" unless defined $nsid;
+        _nvme_connect($scfg);
+        my $dev = _nvme_find_dev_by_nsid($scfg, $nsid);
+        die "[Nasty] NVMe device not found for NSID $nsid after connect\n" unless $dev;
+        return _untaint_abs_path($dev);
     } else {
         die "[Nasty] unknown transport mode '$mode'\n";
     }
@@ -945,6 +1007,19 @@ sub deactivate_volume {
     return 1;
 }
 
+sub volume_has_feature {
+    my ($class, $scfg, $feature, $storeid, $volname, $snapname, $running, $opts) = @_;
+
+    my $features = {
+        snapshot => { current => 1 },
+        clone    => { current => 1, snap => 1 },
+        copy     => { current => 1, snap => 1 },
+    };
+
+    my $key = $snapname ? 'snap' : 'current';
+    return ($features->{$feature} && $features->{$feature}->{$key}) ? 1 : undef;
+}
+
 sub volume_snapshot {
     my ($class, $scfg, $storeid, $volname, $snap) = @_;
 
@@ -1023,7 +1098,9 @@ sub volume_size_info {
         name       => $volname,
     });
 
-    return ($sv->{volsize_bytes} // 0, 'raw', $sv->{used_bytes} // 0, undef);
+    my $bytes = $sv->{volsize_bytes} // 0;
+    my $used  = $sv->{used_bytes} // 0;
+    return wantarray ? ($bytes, 'raw', $used, undef) : $bytes;
 }
 
 sub volume_resize {
