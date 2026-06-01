@@ -46,7 +46,7 @@ my %CACHE_INVALIDATE = (
     'share.nvmeof.remove_namespace' => ['share.nvmeof.list'],
 );
 
-our $VERSION = '0.1.3';
+our $VERSION = '0.1.4';
 
 sub api {
     my $tested_apiver = 14;
@@ -179,12 +179,12 @@ sub check_config {
 sub parse_volname {
     my ($class, $volname) = @_;
 
-    # pve-vm-100-disk-0
-    # pve-vm-100-state-snapname
-    # pve-pve-snapclone-vm-100-disk-0-snapname
-    if ($volname =~ m!^([^-]+(?:-[^-]+)*)-vm-(\d+)-(\S+)$!) {
+    # pve/vm-100-disk-0
+    # pve/vm-100-state-snapname
+    # pve/pve-snapclone-vm-100-disk-0-snapname
+    if ($volname =~ m!^([^/]+)/vm-(\d+)-(\S+)$!) {
         my ($prefix, $vmid, $rest) = ($1, $2, $3);
-        my $name = "$prefix-vm-$vmid-$rest";
+        my $name = "$prefix/vm-$vmid-$rest";
         return ('images', $name, $vmid, undef, undef, 0, 'raw');
     }
 
@@ -713,21 +713,7 @@ sub activate_storage {
     my $info = _api_call($scfg, 'system.info');
     _log($scfg, 1, "[Nasty] connected to Nasty $info->{version}");
 
-    # 2. Ensure prefix subvolume exists
-    my $fs     = $scfg->{nasty_filesystem};
-    my $prefix = $scfg->{nasty_subvolume_prefix};
-    my $existing = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $prefix }) };
-    if ($@ && $@ !~ /not found/i) { die $@; }
-    unless ($existing) {
-        _log($scfg, 1, "[Nasty] creating prefix subvolume '$prefix' on filesystem '$fs'");
-        _api_call($scfg, 'subvolume.create', {
-            filesystem    => $fs,
-            name          => $prefix,
-            subvolume_type => 'filesystem',
-        });
-    }
-
-    # 3. Verify target/subsystem exists
+    # 2. Verify target/subsystem exists
     my $mode = $scfg->{nasty_transport_mode} // 'iscsi';
     if ($mode eq 'iscsi') {
         _iscsi_target_id($scfg);  # dies if not found
@@ -776,12 +762,12 @@ sub list_images {
     for my $sv (@$subvols) {
         my $name = $sv->{name};
 
-        # Only manage volumes using our prefix
-        next unless $name =~ m!^\Q$prefix\E-vm-(\d+)-!;
+        # Only manage volumes under our prefix
+        next unless $name =~ m!^\Q$prefix\E/vm-(\d+)-!;
         my $svmid = $1;
 
         # Skip snapclones
-        next if $name =~ m!^\Q$prefix\E-pve-snapclone-!;
+        next if $name =~ m!^\Q$prefix\E/pve-snapclone-!;
 
         # Filter by vmid if requested
         next if defined $vmid && $svmid != $vmid;
@@ -813,7 +799,7 @@ sub _next_disk_num {
     die "[Nasty] _next_disk_num: subvolume.list failed: $@" if $@;
     my $max = -1;
     for my $sv (@$subvols) {
-        if ($sv->{name} =~ m!^\Q$prefix\E-vm-\Q$vmid\E-disk-(\d+)$!) {
+        if ($sv->{name} =~ m!^\Q$prefix\E/vm-\Q$vmid\E-disk-(\d+)$!) {
             $max = $1 if $1 > $max;
         }
     }
@@ -830,10 +816,10 @@ sub alloc_image {
     my $volname;
     if ($name) {
         # Proxmox passed an explicit name (e.g. for vmstate)
-        $volname = "$prefix-$name";
+        $volname = "$prefix/$name";
     } else {
         my $n = _next_disk_num($scfg, $vmid);
-        $volname = "$prefix-vm-$vmid-disk-$n";
+        $volname = "$prefix/vm-$vmid-disk-$n";
     }
 
     # size is in KB from Proxmox
@@ -909,9 +895,9 @@ sub _resolve_dev_path {
 sub _snapclone_volname {
     my ($scfg, $volname, $snapname) = @_;
     my $prefix = $scfg->{nasty_subvolume_prefix};
-    # volname is like "pve-vm-100-disk-0", extract disk part
-    (my $diskpart = $volname) =~ s!^\Q$prefix\E-!!;
-    return "$prefix-pve-snapclone-$diskpart-$snapname";
+    # volname is like "pve/vm-100-disk-0", extract disk part after prefix/
+    (my $diskpart = $volname) =~ s!^\Q$prefix\E/!!;
+    return "$prefix/pve-snapclone-$diskpart-$snapname";
 }
 
 sub path {

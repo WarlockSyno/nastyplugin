@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.4 — 2026-06-01
+
+- Fixed volname separator: all subvolume names now use slash (`pve/vm-100-disk-0`) matching the NASty API path model, replacing the incorrect dash convention.
+- Fixed `activate_storage`: removed erroneous prefix Filesystem subvolume creation, which blocked all subsequent Block subvolume creation under the prefix; prefix directory is now created implicitly by the NASty engine on first `alloc_image`.
+
 ## 0.1.3 — 2026-06-01
 
 - Updated storage API compatibility to PVE API level 14 (system APIVER=14, APIAGE=5).
