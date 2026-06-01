@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.5 — 2026-06-01
+
+- Fixed `volume_snapshot_info` to not reference the absent `created_at` field (NASty snapshot API returns no timestamp); timestamps now explicitly return 0.
+- Fixed `snapshot.create` to explicitly pass `read_only: true`, matching the NASty engine's actual behaviour.
+
 ## 0.1.4 — 2026-06-01
 
 - Fixed volname separator: all subvolume names now use slash (`pve/vm-100-disk-0`) matching the NASty API path model, replacing the incorrect dash convention.

@@ -46,7 +46,7 @@ my %CACHE_INVALIDATE = (
     'share.nvmeof.remove_namespace' => ['share.nvmeof.list'],
 );
 
-our $VERSION = '0.1.4';
+our $VERSION = '0.1.5';
 
 sub api {
     my $tested_apiver = 14;
@@ -1015,6 +1015,7 @@ sub volume_snapshot {
         filesystem => $scfg->{nasty_filesystem},
         subvolume  => $volname,
         name       => $snap,
+        read_only  => \1,  # NASty always creates read-only; be explicit
     });
 
     return undef;
@@ -1069,7 +1070,7 @@ sub volume_snapshot_info {
         my $name = $s->{name} // next;
         $res->{$name} = {
             id        => $name,
-            timestamp => $s->{created_at} // 0,
+            timestamp => 0,  # NASty API does not expose snapshot creation time
         };
     }
 

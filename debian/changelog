@@ -1,3 +1,10 @@
+nasty-proxmox-plugin (0.1.5) bookworm; urgency=medium
+
+  * Fix volume_snapshot_info: remove reference to absent created_at field; timestamps return 0.
+  * Fix snapshot.create: pass read_only=true explicitly per NASty engine behaviour.
+
+ -- NastyPlugin Maintainers <noreply@github.com>  Sun, 01 Jun 2026 00:00:00 +0000
+
 nasty-proxmox-plugin (0.1.4) bookworm; urgency=medium
 
   * Fix volname separator: use slash (pve/vm-100-disk-0) matching NASty API path model.
