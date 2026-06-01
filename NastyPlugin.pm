@@ -46,7 +46,7 @@ my %CACHE_INVALIDATE = (
     'share.nvmeof.remove_namespace' => ['share.nvmeof.list'],
 );
 
-our $VERSION = '0.1.5';
+our $VERSION = '0.1.6';
 
 sub api {
     my $tested_apiver = 14;
@@ -396,9 +396,14 @@ sub _api_call {
         }
     }
 
-    # Retry once on connection errors (e.g., stale socket after forked child exits)
+    # Retry once on connection errors (e.g., stale socket after forked child exits).
+    # A short backoff between attempts avoids hammering the API during transient
+    # network blips and gives the kernel time to recycle the socket.
     my $last_err;
     for my $retry (1..2) {
+        if ($retry > 1) {
+            select(undef, undef, undef, 0.1);  # 100ms backoff
+        }
         my $conn = eval { _ws_ensure_connected($scfg) };
         if ($@) {
             $last_err = $@;
@@ -683,12 +688,15 @@ sub _remove_from_share {
     if ($mode eq 'iscsi') {
         my $lun_id = _iscsi_find_lun($scfg, $block_device);
         return unless defined $lun_id;
-        _iscsi_remove_scsi_device($scfg, $lun_id);
         my $tid = _iscsi_target_id($scfg);
+        # Remove LUN from target first so no new initiator commands are accepted,
+        # then clean up the local SCSI device.  Reversing this order causes
+        # TARGET_CORE to log NON_EXISTENT_LUN for in-flight initiator retries.
         _api_call($scfg, 'share.iscsi.remove_lun', {
             target_id => $tid,
             lun_id    => $lun_id,
         });
+        _iscsi_remove_scsi_device($scfg, $lun_id);
     } elsif ($mode eq 'nvme-tcp') {
         my $nsid = _nvme_find_ns($scfg, $block_device);
         return unless defined $nsid;

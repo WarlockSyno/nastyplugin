@@ -1,6 +1,6 @@
 # NastyPlugin for Proxmox VE
 
-**Version:** 0.1.5 — 2026-06-01
+**Version:** 0.1.6 — 2026-06-01
 
 A Proxmox VE custom storage plugin that exposes a [Nasty](https://github.com/nasty-project/nasty)
 NAS appliance as shared block storage. VM disks are bcachefs Block subvolumes on Nasty,

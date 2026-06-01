@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.6 — 2026-06-01
+
+- Fixed iSCSI `NON_EXISTENT_LUN` kernel log noise during `free_image`: reversed the operation order in `_remove_from_share` so the NASty target removes the LUN before the initiator-side SCSI device is deleted. Once the target stops servicing the LUN, in-flight initiator commands get a clean SCSI error instead of `NON_EXISTENT_LUN` retries.
+- Added 100ms backoff between `_api_call` WebSocket retry attempts to avoid hammering the API during transient network blips and give the kernel time to recycle the socket after a forked-child exit.
+
 ## 0.1.5 — 2026-06-01
 
 - Fixed `volume_snapshot_info` to not reference the absent `created_at` field (NASty snapshot API returns no timestamp); timestamps now explicitly return 0.
