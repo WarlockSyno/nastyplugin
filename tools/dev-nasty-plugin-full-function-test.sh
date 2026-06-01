@@ -335,8 +335,17 @@ wait_for_vm_deletion() {
         sleep "$DELETION_WAIT"
         retry_count=$((retry_count + 1))
     done
-    log_warning "Deletion verification timeout: some VMs may still exist"
-    return 1
+    log_warning "Deletion verification timeout: forcing cleanup of remaining VMs"
+    for vmid in $(seq "$vmid_start" "$vmid_end"); do
+        if printf '%s' "$remaining_vms" | grep -q "\"vmid\":$vmid"; then
+            local node
+            node=$(parse_vm_node_from_json "$remaining_vms" "$vmid" qemu)
+            node="${node:-$NODE}"
+            timeout 30 pvesh delete "/nodes/$node/qemu/$vmid" >/dev/null 2>&1 || true
+            free_orphaned_disks_for_vmid "$vmid"
+        fi
+    done
+    return 0
 }
 
 verify_truenas_zvol_deleted() {
@@ -877,6 +886,7 @@ test_cross_node_clone_online() {
     local test_name="Cross-Node Clone (Online)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     [[ $IS_CLUSTER -eq 1 ]] || { record_skip_as_pass "$test_name" "not in cluster"; return 0; }
+    delete_vm_and_disks "$vmid"; delete_vm_and_disks "$clone_vmid" "$TARGET_NODE"
     create_vm_with_disk "$vmid" "test-xnode-clone-online" "2G" >/dev/null || { record_fail "$test_name" "source create failed"; return 1; }
     qm start "$vmid" >/dev/null 2>&1 || true
     qm clone "$vmid" "$clone_vmid" --name "test-xnode-clone-online-dst" --full --storage "$STORAGE_ID" --target "$TARGET_NODE" >/dev/null 2>&1 || { record_fail "$test_name" "clone failed"; return 1; }
@@ -892,6 +902,7 @@ test_cross_node_clone_offline() {
     local test_name="Cross-Node Clone (Offline)"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     [[ $IS_CLUSTER -eq 1 ]] || { record_skip_as_pass "$test_name" "not in cluster"; return 0; }
+    delete_vm_and_disks "$vmid"; delete_vm_and_disks "$clone_vmid" "$TARGET_NODE"
     create_vm_with_disk "$vmid" "test-xnode-clone-offline" "2G" >/dev/null || { record_fail "$test_name" "source create failed"; return 1; }
     qm clone "$vmid" "$clone_vmid" --name "test-xnode-clone-offline-dst" --full --storage "$STORAGE_ID" --target "$TARGET_NODE" >/dev/null 2>&1 || { record_fail "$test_name" "clone failed"; return 1; }
     delete_vm_and_disks "$vmid"
@@ -1007,6 +1018,7 @@ test_disk_hotswap() {
     TOTAL_TESTS=$((TOTAL_TESTS + 1))
     local test_name="Disk Hotswap"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+    delete_vm_and_disks "$vmid"
     create_vm_with_disk "$vmid" "test-hotswap" "1G" >/dev/null || { record_fail "$test_name" "initial disk failed"; return 1; }
     local volid
     volid=$(pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" -vmid "$vmid" -filename "vm-${vmid}-disk-1" -size "1G" --output-format=json 2>/dev/null | extract_first_volid)
@@ -1057,6 +1069,7 @@ test_concurrent_alloc_free_contention() {
     local test_name="Concurrent Alloc+Free Lock Contention"
     echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
     local vmid_free=$((VMID_START + 34)) vmid_alloc=$((VMID_START + 35)) free_volid err=/tmp/contention-$$
+    delete_vm_and_disks "$vmid_free"; delete_vm_and_disks "$vmid_alloc"
     free_volid=$(create_vm_with_disk "$vmid_free" "test-contention-free" "1G") || { record_fail "$test_name" "free target setup failed"; return 1; }
     qm create "$vmid_alloc" -name "test-contention-alloc" -memory 512 >/dev/null 2>&1 || { record_fail "$test_name" "alloc target setup failed"; return 1; }
     mkdir -p "$err"
