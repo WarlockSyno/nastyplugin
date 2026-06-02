@@ -544,7 +544,13 @@ delete_vm_and_disks() {
     local vmid="$1"
     local node="${2:-$NODE}"
     pvesh delete "/nodes/$node/qemu/$vmid" >/dev/null 2>&1 || true
-    sleep "$DELETION_WAIT"
+    # pvesh delete returns immediately with a UPID; the actual destroy is async.
+    # Poll the config file so we don't race subsequent qm create calls.
+    for _ in $(seq 1 20); do
+        local conf="/etc/pve/nodes/$node/qemu-server/${vmid}.conf"
+        [[ -e "$conf" ]] || break
+        sleep 0.5
+    done
     free_orphaned_disks_for_vmid "$vmid"
 }
 
