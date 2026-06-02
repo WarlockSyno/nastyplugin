@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.7 — 2026-06-02
+
+- Fixed `_resolve_dev_path` dying when a volume's iSCSI LUN or NVMe namespace is absent from the share (stale state after NASty restart or a previous partial cleanup). It now re-exposes the block device via `_add_to_share` and retries before dying, allowing `path()` to succeed and `free_image` to complete the cleanup.
+
 ## 0.1.6 — 2026-06-01
 
 - Fixed iSCSI `NON_EXISTENT_LUN` kernel log noise during `free_image`: reversed the operation order in `_remove_from_share` so the NASty target removes the LUN before the initiator-side SCSI device is deleted. Once the target stops servicing the LUN, in-flight initiator commands get a clean SCSI error instead of `NON_EXISTENT_LUN` retries.

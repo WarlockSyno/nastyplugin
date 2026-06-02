@@ -46,7 +46,7 @@ my %CACHE_INVALIDATE = (
     'share.nvmeof.remove_namespace' => ['share.nvmeof.list'],
 );
 
-our $VERSION = '0.1.6';
+our $VERSION = '0.1.7';
 
 sub api {
     my $tested_apiver = 14;
@@ -882,7 +882,14 @@ sub _resolve_dev_path {
 
     if ($mode eq 'iscsi') {
         my $lun_id = _iscsi_find_lun($scfg, $block_device);
-        die "[Nasty] no LUN found for block device $block_device\n" unless defined $lun_id;
+        unless (defined $lun_id) {
+            # Namespace may have been removed from the share (e.g. stale volume after NASty
+            # restart). Re-expose it so path() can proceed and free_image can clean up.
+            _log($scfg, 2, "[Nasty] _resolve_dev_path: LUN missing for $block_device, re-exposing");
+            _add_to_share($scfg, $block_device);
+            $lun_id = _iscsi_find_lun($scfg, $block_device);
+            die "[Nasty] no LUN found for block device $block_device after re-exposing\n" unless defined $lun_id;
+        }
         _iscsi_login($scfg);
         my $dev = _iscsi_rescan($scfg, $lun_id);
         die "[Nasty] device not found for LUN $lun_id after rescan\n" unless $dev;
@@ -890,7 +897,14 @@ sub _resolve_dev_path {
     } elsif ($mode eq 'nvme-tcp') {
         # Find NSID from the NASty API, then locate /dev/nvme<ctrl>n<nsid>
         my $nsid = _nvme_find_ns($scfg, $block_device);
-        die "[Nasty] no NVMe namespace found for block device $block_device\n" unless defined $nsid;
+        unless (defined $nsid) {
+            # Namespace may have been removed from the share (e.g. stale volume after NASty
+            # restart). Re-expose it so path() can proceed and free_image can clean up.
+            _log($scfg, 2, "[Nasty] _resolve_dev_path: NVMe namespace missing for $block_device, re-exposing");
+            _add_to_share($scfg, $block_device);
+            $nsid = _nvme_find_ns($scfg, $block_device);
+            die "[Nasty] no NVMe namespace found for block device $block_device after re-exposing\n" unless defined $nsid;
+        }
         _nvme_connect($scfg);
         my $dev = _nvme_find_dev_by_nsid($scfg, $nsid);
         die "[Nasty] NVMe device not found for NSID $nsid after connect\n" unless $dev;

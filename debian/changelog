@@ -1,3 +1,9 @@
+nasty-proxmox-plugin (0.1.7) bookworm; urgency=medium
+
+  * Fix _resolve_dev_path dying on stale volumes: re-expose block device via _add_to_share when LUN/namespace is absent, allowing path() to succeed and free_image to complete cleanup.
+
+ -- NastyPlugin Maintainers <noreply@github.com>  Mon, 02 Jun 2026 00:00:00 +0000
+
 nasty-proxmox-plugin (0.1.6) bookworm; urgency=medium
 
   * Fix iSCSI NON_EXISTENT_LUN log noise: reverse _remove_from_share order so target removes LUN before initiator sysfs delete.

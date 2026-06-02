@@ -1,0 +1,54 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 200" width="800" height="200">
+  <defs>
+    <linearGradient id="np-bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="np-orange" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#ff8c00"/>
+      <stop offset="100%" stop-color="#ffdc00"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background -->
+  <rect width="800" height="200" rx="16" fill="url(#np-bg)"/>
+
+  <!-- Storage stack glyph (left side) -->
+  <g transform="translate(60, 50)">
+    <!-- Bottom disk -->
+    <rect x="0" y="80" width="100" height="20" rx="3" fill="#2d333b" stroke="#ff8c00" stroke-width="2"/>
+    <!-- Middle disk -->
+    <rect x="0" y="50" width="100" height="20" rx="3" fill="#2d333b" stroke="#ff8c00" stroke-width="2"/>
+    <!-- Top disk -->
+    <rect x="0" y="20" width="100" height="20" rx="3" fill="#2d333b" stroke="#ff8c00" stroke-width="2"/>
+    <!-- LED indicators -->
+    <circle cx="88" cy="30" r="2.5" fill="#67c153"/>
+    <circle cx="88" cy="60" r="2.5" fill="#67c153"/>
+    <circle cx="88" cy="90" r="2.5" fill="#d71f1d"/>
+
+    <!-- Proxmox-style bracket connecting to text -->
+    <path d="M 100 60 L 130 60" stroke="#ff8c00" stroke-width="3" stroke-linecap="round"/>
+    <path d="M 125 45 L 125 75" stroke="#ff8c00" stroke-width="3" stroke-linecap="round"/>
+  </g>
+
+  <!-- Text: NastyPlugin -->
+  <g transform="translate(210, 0)">
+    <!-- Nasty in orange gradient -->
+    <text x="0" y="115" font-family="'SF Pro Display', 'Inter', 'Segoe UI', sans-serif"
+          font-size="72" font-weight="800" fill="url(#np-orange)" letter-spacing="-2">
+      NASty
+    </text>
+    <!-- Plugin in white -->
+    <text x="232" y="115" font-family="'SF Pro Display', 'Inter', 'Segoe UI', sans-serif"
+          font-size="72" font-weight="300" fill="#e6edf3" letter-spacing="-2">
+      Plugin
+    </text>
+    <!-- Red slash accent between words -->
+    <rect x="222" y="60" width="4" height="60" fill="#d71f1d"/>
+    <!-- Subtitle -->
+    <text x="2" y="150" font-family="'SF Mono', 'JetBrains Mono', monospace"
+          font-size="16" font-weight="500" fill="#7d8590" letter-spacing="3">
+      PROXMOX VE  ·  BCACHEFS  ·  iSCSI / NVMe-oF
+    </text>
+  </g>
+</svg>
