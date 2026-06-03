@@ -1,26 +1,34 @@
 # Installation
 
-## Quick Install
+## Install
 
 ```bash
-dpkg -i nasty-proxmox-plugin_0.1.1_all.deb
+dpkg -i nasty-proxmox-plugin_*.deb
 ```
 
-Then configure storage:
+If there are missing dependencies:
 
 ```bash
-pvesm add nastyplugin my-nasty \
-  --nasty_api_host 10.15.15.60 \
-  --nasty_api_token YOUR_TOKEN \
-  --nasty_filesystem tank \
-  --nasty_subvolume_prefix pve \
-  --nasty_transport_mode iscsi \
-  --nasty_iscsi_target iqn.2026-01.com.nasty:pve
+apt-get install -f
 ```
 
-## Building from Source
+After installation, restart the PVE storage daemon:
 
 ```bash
-cd nastyplugin
+systemctl restart pvedaemon pveproxy
+```
+
+## Remove
+
+```bash
+dpkg -r nasty-proxmox-plugin
+systemctl restart pvedaemon pveproxy
+```
+
+## Build from Source
+
+```bash
 tools/build-deb.sh
 ```
+
+The resulting `.deb` is written to the repo root.

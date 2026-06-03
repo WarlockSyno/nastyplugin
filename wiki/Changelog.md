@@ -2,54 +2,54 @@
 
 ## 0.1.7 — 2026-06-02
 
-- Fixed `_resolve_dev_path` dying when a volume's iSCSI LUN or NVMe namespace is absent from the share (stale state after NASty restart or a previous partial cleanup). It now re-exposes the block device via `_add_to_share` and retries before dying, allowing `path()` to succeed and `free_image` to complete the cleanup.
+- Fixed a crash when activating or deleting a volume whose block device had been removed from the
+  storage target (e.g. after a NASty restart or a previous incomplete cleanup). The plugin now
+  re-attaches the block device automatically and retries, allowing the operation to complete cleanly.
 
 ## 0.1.6 — 2026-06-01
 
-- Fixed iSCSI `NON_EXISTENT_LUN` kernel log noise during `free_image`: reversed the operation order in `_remove_from_share` so the NASty target removes the LUN before the initiator-side SCSI device is deleted. Once the target stops servicing the LUN, in-flight initiator commands get a clean SCSI error instead of `NON_EXISTENT_LUN` retries.
-- Added 100ms backoff between `_api_call` WebSocket retry attempts to avoid hammering the API during transient network blips and give the kernel time to recycle the socket after a forked-child exit.
+- Fixed spurious kernel log errors (`NON_EXISTENT_LUN`) that appeared during disk deletion when
+  using iSCSI transport. The target-side cleanup now happens before the initiator-side cleanup,
+  preventing the kernel from retrying commands against a LUN that no longer exists.
+- Improved stability of the NASty API connection under transient network blips; added a short
+  backoff between retries.
 
 ## 0.1.5 — 2026-06-01
 
-- Fixed `volume_snapshot_info` to not reference the absent `created_at` field (NASty snapshot API returns no timestamp); timestamps now explicitly return 0.
-- Fixed `snapshot.create` to explicitly pass `read_only: true`, matching the NASty engine's actual behaviour.
+- Fixed snapshot info returning an invalid timestamp (NASty does not provide snapshot creation
+  times; the plugin now correctly returns a zero value).
+- Fixed snapshots not being marked read-only at creation time.
 
 ## 0.1.4 — 2026-06-01
 
-- Fixed volname separator: all subvolume names now use slash (`pve/vm-100-disk-0`) matching the NASty API path model, replacing the incorrect dash convention.
-- Fixed `activate_storage`: removed erroneous prefix Filesystem subvolume creation, which blocked all subsequent Block subvolume creation under the prefix; prefix directory is now created implicitly by the NASty engine on first `alloc_image`.
+- Fixed VM disk names to use the correct format expected by the NASty API.
+- Fixed storage activation creating an unnecessary directory structure that prevented VM disk
+  creation from succeeding. Disk directories are now created automatically on first use.
 
 ## 0.1.3 — 2026-06-01
 
-- Updated storage API compatibility to PVE API level 14 (system APIVER=14, APIAGE=5).
-- Replaced NVMe device discovery: `_nvme_rescan` removed in favour of `_nvme_find_dev_by_nsid`, which locates the NVMe-TCP controller by NQN in sysfs and returns `/dev/nvme<ctrl>n<nsid>` — correct even when multiple controllers are present or controller indices change.
-- Fixed taint-mode crash in `_iscsi_remove_scsi_device`: `readlink()` returns tainted strings; extract the device name with a capturing regex to untaint it before use in `open()` (pvedaemon runs with `-T`).
-- Fixed WebSocket stale-connection failure after forked child (e.g., LXC clone rsync) closes the inherited socket: `_api_call` now retries once on send/recv errors after dropping the cached connection.
-- Fixed NVMe idempotent activation: detect an already-live controller by subsystem NQN in sysfs before running `nvme connect`, avoiding the nvme-cli `already connected` exit-1 path during `pvesm free` and deletion cleanup.
-- Fixed NVMe live migration when other NVMe/TCP sessions on the destination use the same `/etc/nvme/hostid` with a different hostnqn: `nvme connect` now passes a deterministic hostid derived from the NASty hostnqn.
+- Updated compatibility to Proxmox VE storage API level 14.
+- Fixed NVMe-TCP disk discovery when multiple NVMe controllers are present on the host.
+- Fixed a crash on Proxmox installations running in taint mode (the default).
+- Fixed NVMe-TCP activation when a previous connection attempt left a stale session.
+- Fixed live VM migration over NVMe-TCP on hosts that share a NVMe host identifier with
+  another storage system.
+- Fixed dropped API connections after Proxmox forks a child process (e.g. during LXC backup).
 
 ## 0.1.2 — 2026-06-01
 
-- Fixed iSCSI ghost device leak: remove the initiator-side SCSI disk node via sysfs before removing a LUN from the NASty target, preventing stale 0-byte devices and NON_EXISTENT_LUN kernel spam.
+- Fixed iSCSI ghost devices accumulating on the Proxmox host after disk deletion, which
+  caused `NON_EXISTENT_LUN` kernel log spam on subsequent operations.
 
 ## 0.1.1 — 2026-05-31
 
-- Added Proxmox storage API compatibility declaration for PVE 8/9 custom plugin loading.
-- Fixed WebSocket response handling to skip initial authentication broadcasts and runtime event frames.
-- Fixed NASty block subvolume naming to use flat volume names accepted by the appliance API.
-- Fixed numeric JSON encoding for allocate and resize requests.
-- Fixed snapshot info return shape for the current Proxmox storage wrapper API.
-- Fixed iSCSI path resolution to ensure target login and keep iscsiadm output from polluting `pvesm path`.
-- Updated the full-function test script for current Proxmox CLI behavior.
-- Expanded the NASty full-function test script to mirror the TrueNAS plugin test function coverage with NASty-specific backend checks.
-- Optimized pre-flight cleanup in the full-function test script to avoid silent per-VMID storage scans.
-- Fixed full-function test failure accounting so error logging cannot break shell returns.
-- Fixed `volume_size_info` scalar-context return for Proxmox 9 disk attachment and resize validation.
-- Advertised snapshot/clone/copy feature support to Proxmox and untainted device paths for LXC rootfs formatting.
-- Fixed full-function test NASty API helper JSON parameter handling and single-phase reruns.
+- Fixed plugin loading on Proxmox VE 8 and 9.
+- Fixed several issues with iSCSI path resolution, NVMe-TCP device discovery, snapshot
+  handling, and volume size reporting.
+- Improved reliability of the full-function test suite.
 
 ## 0.1.0 — 2026-05-31
 
 - Initial release.
-- iSCSI and NVMe-oF transport support.
-- Full Proxmox storage plugin interface: alloc, free, list, snapshot, resize, path.
+- iSCSI and NVMe-TCP transport support.
+- Full Proxmox storage plugin interface: create, delete, list, snapshot, resize, path.

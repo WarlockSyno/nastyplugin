@@ -4,30 +4,43 @@
 
 # NastyPlugin for Proxmox VE
 
-**Version:** 0.1.7 — 2026-06-02
+A Proxmox VE custom storage plugin that exposes a [NASty](https://github.com/nasty-project/nasty)
+NAS appliance as shared block storage via iSCSI or NVMe-TCP. VM disks are backed by bcachefs
+Block subvolumes on the NASty appliance and presented as raw block devices to Proxmox.
 
-A Proxmox VE custom storage plugin that exposes a [Nasty](https://github.com/nasty-project/nasty)
-NAS appliance as shared block storage. VM disks are bcachefs Block subvolumes on Nasty,
-exposed over iSCSI or NVMe-oF (NVMe/TCP).
+## Features
+
+- **Copy-on-write snapshots** — near-instant, space-efficient VM snapshots backed by bcachefs
+- **Transparent compression** — reduces VM disk footprint without manual tuning
+- **Data integrity** — bcachefs checksumming detects silent corruption
+- **Shared block storage** — enables live migration across all nodes in a PVE cluster
+- **Dual transport** — iSCSI for broad compatibility, NVMe-TCP for lower latency
+- **Thin provisioning** — VM disks allocated on demand, no capacity pre-reserved
 
 ## Requirements
 
 - Proxmox VE 8.0+
-- Nasty appliance with a configured bcachefs filesystem
-- `open-iscsi` (iSCSI transport) or `nvme-cli` (NVMe-oF transport)
+- NASty appliance with a configured bcachefs filesystem
+- `open-iscsi` (iSCSI transport) or `nvme-cli` (NVMe-TCP transport)
 
-## Installation
+## Quick Start
 
-See [wiki/Installation.md](wiki/Installation.md).
+```bash
+dpkg -i nasty-proxmox-plugin_*.deb
+```
 
-## Configuration
+See [wiki/Installation.md](wiki/Installation.md) and [wiki/Configuration.md](wiki/Configuration.md).
 
-See [wiki/Configuration.md](wiki/Configuration.md).
+## Documentation
 
-## Testing
+- [Installation](wiki/Installation.md)
+- [Configuration](wiki/Configuration.md)
+- [Changelog](wiki/Changelog.md)
 
-The development full-function test script mirrors the TrueNAS plugin test function coverage while adapting backend checks to NASty storage semantics, including batched pre-flight cleanup for the test VMID range.
+## License
 
-## Changelog
+GPL-3.0. See [LICENSE](LICENSE).
 
-See [wiki/Changelog.md](wiki/Changelog.md).
+---
+
+**Version:** 0.1.7 — 2026-06-02

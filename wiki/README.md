@@ -1,29 +1,24 @@
+<p align="center">
+  <img src="../docs/assets/nastyplugin-logo.svg" alt="NastyPlugin" width="640" />
+</p>
+
 # NastyPlugin for Proxmox VE
 
-**Version:** 0.1.7 — 2026-06-02
+A Proxmox VE custom storage plugin that exposes a NASty NAS appliance as shared block storage
+via iSCSI or NVMe-TCP.
 
-A Proxmox VE custom storage plugin that exposes a [Nasty](https://github.com/nasty-project/nasty)
-NAS appliance as shared block storage. VM disks are bcachefs Block subvolumes on Nasty,
-exposed over iSCSI or NVMe-oF (NVMe/TCP).
+## Pages
+
+- [Installation](Installation.md) — install and remove the .deb package
+- [Configuration](Configuration.md) — NASty appliance setup, storage.cfg keys, and `pvesm add`
+- [Changelog](Changelog.md) — release history
 
 ## Requirements
 
 - Proxmox VE 8.0+
-- Nasty appliance with a configured bcachefs filesystem
-- `open-iscsi` (iSCSI transport) or `nvme-cli` (NVMe-oF transport)
+- NASty appliance with a configured bcachefs filesystem
+- `open-iscsi` (iSCSI transport) or `nvme-cli` (NVMe-TCP transport)
 
-## Installation
+## Support
 
-See [Installation.md](Installation.md).
-
-## Configuration
-
-See [Configuration.md](Configuration.md).
-
-## Testing
-
-The development full-function test script mirrors the TrueNAS plugin test function coverage while adapting backend checks to NASty storage semantics, including batched pre-flight cleanup for the test VMID range.
-
-## Changelog
-
-See [Changelog.md](Changelog.md).
+Open an issue on GitHub.
