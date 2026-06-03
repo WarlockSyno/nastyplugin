@@ -1,0 +1,173 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check version consistency
+        run: |
+          set -euo pipefail
+
+          # Extract versions from each file
+          V_CHANGELOG=$(grep -m1 '^nasty-proxmox-plugin' debian/changelog \
+            | sed 's/nasty-proxmox-plugin (\([^)]*\)).*/\1/')
+          V_PM=$(grep -m1 "our \$VERSION" NastyPlugin.pm \
+            | sed "s/.*our \\\$VERSION = '\\([^']*\\)'.*/\\1/")
+          V_WIKI=$(grep -m1 '^## [0-9]' wiki/Changelog.md \
+            | sed 's/^## \([0-9][^ ]*\).*/\1/')
+          V_README=$(grep -m1 '^\*\*Version:\*\*' README.md \
+            | sed 's/\*\*Version:\*\* \([0-9][^ ]*\).*/\1/')
+
+          # Check for missing extractions
+          MISSING=0
+          for pair in \
+            "debian/changelog:$V_CHANGELOG" \
+            "NastyPlugin.pm:$V_PM" \
+            "wiki/Changelog.md:$V_WIKI" \
+            "README.md:$V_README"
+          do
+            file="${pair%%:*}"
+            val="${pair#*:}"
+            if [ -z "$val" ]; then
+              echo "ERROR: could not extract version from $file"
+              MISSING=1
+            fi
+          done
+          [ "$MISSING" -eq 1 ] && exit 1
+
+          # Check all four agree
+          if [ "$V_CHANGELOG" = "$V_PM" ] && \
+             [ "$V_CHANGELOG" = "$V_WIKI" ] && \
+             [ "$V_CHANGELOG" = "$V_README" ]; then
+            echo "Version check passed: $V_CHANGELOG"
+          else
+            echo "ERROR: version mismatch across files:"
+            printf "  %-25s %s\n" "debian/changelog"  "$V_CHANGELOG"
+            printf "  %-25s %s\n" "NastyPlugin.pm"    "$V_PM"
+            printf "  %-25s %s\n" "wiki/Changelog.md" "$V_WIKI"
+            printf "  %-25s %s\n" "README.md"         "$V_README"
+            exit 1
+          fi
+
+  build:
+    needs: lint
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends git debhelper perl
+
+      - name: Patch changelog for pre-release builds
+        if: |
+          github.ref_type != 'tag' &&
+          github.ref_name != 'main'
+        run: |
+          set -euo pipefail
+          BASE_VERSION=$(grep -m1 '^nasty-proxmox-plugin' debian/changelog \
+            | sed 's/nasty-proxmox-plugin (\([^)]*\)).*/\1/')
+          BRANCH="${{ github.ref_name }}"
+          SANITIZED=$(echo "$BRANCH" | tr '/' '-')
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          PRE_VERSION="${BASE_VERSION}~${SANITIZED}-${SHORT_SHA}"
+          ENTRY="nasty-proxmox-plugin (${PRE_VERSION}) UNRELEASED; urgency=low\n\n  * Pre-release build\n\n -- CI <ci@github.com>  Thu, 01 Jan 1970 00:00:00 +0000\n\n"
+          printf "%b" "$ENTRY" | cat - debian/changelog > debian/changelog.new
+          mv debian/changelog.new debian/changelog
+
+      - name: Build .deb
+        run: dpkg-buildpackage -b -uc -us
+
+      - name: Collect artifact
+        run: |
+          mkdir -p dist
+          mv ../*.deb dist/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-package
+          path: dist/*.deb
+          retention-days: 90
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deb-package
+          path: dist/
+
+      - name: Extract release notes from debian/changelog
+        id: notes
+        run: |
+          NOTES=$(awk '
+            /^[^ ]/ { count++; if (count == 2) exit }
+            count == 1 { print }
+          ' debian/changelog | grep -v '^ --' | sed '/^$/d' | tail -n +2)
+          {
+            echo "body<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Extract version from debian/changelog
+        id: version
+        run: |
+          V=$(grep -m1 '^nasty-proxmox-plugin' debian/changelog \
+            | sed 's/nasty-proxmox-plugin (\([^)]*\)).*/\1/')
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release (tag push)
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/*.deb \
+            --title "${{ github.ref_name }}" \
+            --notes "${{ steps.notes.outputs.body }}" \
+            --latest
+
+      - name: Publish release (main push)
+        if: github.ref_type != 'tag' && github.ref_name == 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest --yes 2>/dev/null || true
+          gh release create latest dist/*.deb \
+            --title "Latest (${{ steps.version.outputs.version }})" \
+            --notes "${{ steps.notes.outputs.body }}" \
+            --latest
+
+      - name: Publish pre-release (other branch push)
+        if: github.ref_type != 'tag' && github.ref_name != 'main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          SANITIZED=$(echo "$BRANCH" | tr '/' '-')
+          SHORT_SHA="${{ github.sha }}"
+          SHORT_SHA="${SHORT_SHA:0:7}"
+          TAG="pre-release-${SANITIZED}-${SHORT_SHA}"
+          gh release create "$TAG" dist/*.deb \
+            --title "Pre-release: ${BRANCH} @ ${SHORT_SHA}" \
+            --prerelease \
+            --clobber
