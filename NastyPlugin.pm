@@ -25,7 +25,6 @@ my %API_CACHE;
 
 # Cache TTLs in seconds
 my %CACHE_TTL = (
-    'subvolume.list'      => 60,
     'share.iscsi.list'    => 60,
     'share.nvmeof.list'   => 60,
     'system.info'         => 300,
@@ -46,7 +45,7 @@ my %CACHE_INVALIDATE = (
     'share.nvmeof.remove_namespace' => ['share.nvmeof.list'],
 );
 
-our $VERSION = '0.1.7';
+our $VERSION = '0.1.9';
 
 sub api {
     my $tested_apiver = 14;
@@ -780,6 +779,15 @@ sub list_images {
         # Filter by vmid if requested
         next if defined $vmid && $svmid != $vmid;
 
+        # Validate subvolume actually exists — NASty's subvolume.list may return
+        # stale entries for recently-deleted subvolumes.  subvolume.get will fail
+        # immediately if the subvolume is truly gone.
+        my $sv_check = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $name }) };
+        if ($@) {
+            _log($scfg, 2, "[Nasty] list_images: skipping stale subvolume '$name'");
+            next;
+        }
+
         my $volname = $name;
         my $volid   = "$storeid:$volname";
 
@@ -790,7 +798,7 @@ sub list_images {
         push @res, {
             volid  => $volid,
             format => 'raw',
-            size   => $sv->{volsize_bytes} // 0,
+            size   => $sv_check->{volsize_bytes} // 0,
             vmid   => $svmid,
             content => 'images',
         };
@@ -820,36 +828,65 @@ sub alloc_image {
     my $fs     = $scfg->{nasty_filesystem};
     my $prefix = $scfg->{nasty_subvolume_prefix};
 
-    # Derive subvolume name
-    my $volname;
-    if ($name) {
-        # Proxmox passed an explicit name (e.g. for vmstate)
-        $volname = "$prefix/$name";
-    } else {
-        my $n = _next_disk_num($scfg, $vmid);
-        $volname = "$prefix/vm-$vmid-disk-$n";
-    }
-
     # size is in KB from Proxmox
     my $bytes = $size * 1024;
 
-    _log($scfg, 1, "[Nasty] alloc_image: $volname ($bytes bytes)");
+    # Retry loop for concurrent allocation — the subvolume.create + transport expose
+    # path is not atomic; two simultaneous callers can collide on the same backend LUN
+    # or namespace slot. Backoff reduces the window of contention.
+    my $max_retries = 3;
+    my $err;
+    for my $retry (1 .. $max_retries) {
+        my $volname;
+        if ($name) {
+            # Proxmox passed an explicit name (e.g. for vmstate) — no retry needed
+            $volname = "$prefix/$name";
+        } else {
+            my $n = _next_disk_num($scfg, $vmid);
+            $volname = "$prefix/vm-$vmid-disk-$n";
+        }
 
-    # Create Block subvolume on Nasty
-    my $sv = _api_call($scfg, 'subvolume.create', {
-        filesystem     => $fs,
-        name           => $volname,
-        subvolume_type => 'block',
-        volsize_bytes  => 0 + $bytes,
-    });
+        _log($scfg, 1, "[Nasty] alloc_image: $volname ($bytes bytes) [try $retry/$max_retries]");
 
-    my $block_device = $sv->{block_device}
-        or die "[Nasty] subvolume.create returned no block_device for $volname\n";
+        my $sv;
+        eval {
+            $sv = _api_call($scfg, 'subvolume.create', {
+                filesystem     => $fs,
+                name           => $volname,
+                subvolume_type => 'block',
+                volsize_bytes  => 0 + $bytes,
+            });
+        };
+        if ($@) {
+            $err = $@;
+            _log($scfg, 1, "[Nasty] alloc_image subvolume.create failed: $err");
+            # Clean up orphaned subvolume before retrying
+            eval { _api_call($scfg, 'subvolume.delete', { filesystem => $fs, name => $volname }) };
+            last if $retry == $max_retries;
+            select(undef, undef, undef, 0.5 * $retry);  # escalating backoff
+            next;
+        }
 
-    # Expose via transport
-    _add_to_share($scfg, $block_device);
+        my $block_device = $sv->{block_device}
+            or do { $err = "subvolume.create returned no block_device for $volname"; eval { _api_call($scfg, 'subvolume.delete', { filesystem => $fs, name => $volname }) }; last; };
 
-    return $volname;
+        eval {
+            _add_to_share($scfg, $block_device);
+        };
+        if ($@) {
+            $err = $@;
+            _log($scfg, 1, "[Nasty] alloc_image _add_to_share failed: $err");
+            # Clean up the subvolume we just created before retrying
+            eval { _api_call($scfg, 'subvolume.delete', { filesystem => $fs, name => $volname }) };
+            last if $retry == $max_retries;
+            select(undef, undef, undef, 0.5 * $retry);  # escalating backoff
+            next;
+        }
+
+        return $volname;
+    }
+
+    die "[Nasty] alloc_image failed after $max_retries retries: $err\n";
 }
 
 sub free_image {
@@ -872,6 +909,25 @@ sub free_image {
     }
 
     _api_call($scfg, 'subvolume.delete', { filesystem => $fs, name => $volname });
+    # Verify deletion actually completed — NASty subvolume.delete returns before
+    # the subvolume is physically gone; it can take 2-3 minutes for the subvolume to
+    # disappear from subvolume.list. Use aggressive retries to avoid stale cache
+    # entries confusing pvesm list during VM deletion.
+    my $deleted = 0;
+    for my $try (1..30) {
+        eval {
+            _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $volname });
+        };
+        if ($@) {
+            $deleted = 1;
+        }
+        warn "[Nasty] free_image: subvolume still exists after delete (try $try)" unless $deleted;
+        last if $deleted;
+        sleep(5) if $try < 30;
+    }
+
+    warn "[Nasty] free_image: subvolume $volname may not have been deleted" unless $deleted;
+    $deleted or return undef;
 
     return undef;
 }
@@ -1047,12 +1103,12 @@ sub volume_snapshot_delete {
     my ($class, $scfg, $storeid, $volname, $snap, $running) = @_;
 
     my $fs = $scfg->{nasty_filesystem};
-
-    _log($scfg, 1, "[Nasty] volume_snapshot_delete: $volname @ $snap");
-
-    # 1. Clean up any stale snap-clone for this snapshot
     my $clone_name = _snapclone_volname($scfg, $volname, $snap);
-    my $existing = eval { _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $clone_name }) };
+    # Clean up any stale snapshot clone if it exists
+    my $existing;
+    eval {
+        $existing = _api_call($scfg, 'subvolume.get', { filesystem => $fs, name => $clone_name });
+    };
     if ($existing) {
         _log($scfg, 1, "[Nasty] cleaning up stale snap-clone: $clone_name");
         if (my $bd = $existing->{block_device}) {
@@ -1062,8 +1118,7 @@ sub volume_snapshot_delete {
         eval { _api_call($scfg, 'subvolume.delete', { filesystem => $fs, name => $clone_name }) };
         warn "[Nasty] snap-clone cleanup delete warning: $@" if $@;
     }
-
-    # 2. Delete the snapshot
+    # 1. Delete the snapshot
     _api_call($scfg, 'snapshot.delete', {
         filesystem => $fs,
         subvolume  => $volname,
@@ -1075,9 +1130,9 @@ sub volume_snapshot_delete {
 
 sub volume_snapshot_rollback {
     my ($class, $scfg, $storeid, $volname, $snap) = @_;
-    die "[Nasty] snapshot rollback is not supported\n";
-    # TODO: revisit when Nasty adds native snapshot.restore API support
+    die "[Nasty] snapshot rollback is not supported (bcachefs limitation)\n";
 }
+
 
 sub volume_snapshot_info {
     my ($class, $scfg, $storeid, $volname) = @_;

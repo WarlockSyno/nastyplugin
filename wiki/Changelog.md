@@ -1,4 +1,17 @@
 # Changelog
+## 0.1.9 — 2026-07-05
+- Fixed unused variable in `free_image` (removed dead `$err` assignment).
+- Fixed subvolume leak in `alloc_image`: orphaned subvolumes now cleaned up on `subvolume.create` failure, `_add_to_share` failure, or missing `block_device`.
+- Fixed orphaned comment numbering in `volume_snapshot_delete`.
+
+- Fixed NVMe Phase 4 disk deletion failures: added 150s retry loop in `free_image` to wait for
+  NASty subvolume deletion to complete before returning. NASty's `subvolume.delete` returns
+  immediately but the subvolume may take 2-3 minutes to fully disappear.
+- Added stale subvolume filtering in `list_images` by validating each entry with `subvolume.get`.
+- Removed cached `subvolume.list` entries from `%API_CACHE` to prevent stale deletion artifacts.
+- Added concurrent allocation retry loop in `alloc_image` (3 retries, escalating backoff) to
+  handle simultaneous VM disk creation.
+
 
 ## 0.1.7 — 2026-06-02
 

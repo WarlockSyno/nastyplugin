@@ -1,4 +1,19 @@
 nasty-proxmox-plugin (0.1.7) bookworm; urgency=medium
+nasty-proxmox-plugin (0.1.9) bookworm; urgency=medium
+
+  * Fixed unused variable in free_image (removed dead $err assignment).
+  * Fixed subvolume leak in alloc_image: orphaned subvolumes now cleaned up on subvolume.create
+    failure, _add_to_share failure, or missing block_device.
+  * Fixed orphaned comment numbering in volume_snapshot_delete.
+
+ -- NastyPlugin Maintainers <noreply@github.com>  Thu, 05 Jul 2026 00:00:00 +0000
+
+
+
+  * Fix NVMe Phase 4 disk deletion: increase free_image subvolume.get retry loop to 30 attempts with 5s backoff (150s total) to handle NASty's slow subvolume deletion that can take 2-3 minutes.
+
+ -- NastyPlugin Maintainers <noreply@github.com>  Sat, 04 Jul 2026 00:00:00 +0000
+
 
   * Fix _resolve_dev_path dying on stale volumes: re-expose block device via _add_to_share when LUN/namespace is absent, allowing path() to succeed and free_image to complete cleanup.
 
