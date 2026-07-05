@@ -45,7 +45,7 @@ my %CACHE_INVALIDATE = (
     'share.nvmeof.remove_namespace' => ['share.nvmeof.list'],
 );
 
-our $VERSION = '0.1.9';
+our $VERSION = '0.1.10';
 
 sub api {
     my $tested_apiver = 14;
@@ -1178,6 +1178,9 @@ sub volume_resize {
         name          => $volname,
         volsize_bytes => 0 + $size,
     });
+
+    # Give NASty a moment to propagate the size change before returning
+    select(undef, undef, undef, 1);
 
     return undef;
 }
