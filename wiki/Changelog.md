@@ -1,4 +1,10 @@
 # Changelog
+## 0.1.11 — 2026-07-05
+
+  Fixed NVMe-TCP disk deletion: `_nvme_disconnect` helper now disconnects PVE-side NVMe controllers
+    before calling `subvolume.delete`, preventing "subvolume is in use by NVMe-oF subsystem" errors.
+    The plugin now explicitly removes NVMe namespaces from the NASty subsystem in `_remove_from_share`
+    before attempting subvolume deletion.
 ## 0.1.9 — 2026-07-05
 - Fixed unused variable in `free_image` (removed dead `$err` assignment).
 - Fixed subvolume leak in `alloc_image`: orphaned subvolumes now cleaned up on `subvolume.create` failure, `_add_to_share` failure, or missing `block_device`.

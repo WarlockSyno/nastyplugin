@@ -45,7 +45,7 @@ my %CACHE_INVALIDATE = (
     'share.nvmeof.remove_namespace' => ['share.nvmeof.list'],
 );
 
-our $VERSION = '0.1.10';
+our $VERSION = '0.1.11';
 
 sub api {
     my $tested_apiver = 14;
@@ -576,6 +576,25 @@ sub _nvme_find_ctrl_idx {
     return undef;
 }
 
+sub _nvme_disconnect {
+    my ($target_nqn) = @_;
+    for my $ctl_dir (glob('/sys/class/nvme-fabrics/ctl/nvme*')) {
+        my $nqn_file = "$ctl_dir/subsysnqn";
+        next unless -f $nqn_file;
+        open(my $fh, '<', $nqn_file) or next;
+        my $nqn = do { local $/; <$fh> };
+        close($fh);
+        chomp $nqn;
+        next unless $nqn eq $target_nqn || $nqn =~ /\Q$target_nqn\E/;
+        my ($ctrl_idx) = ($ctl_dir =~ m!/nvme(\d+)$!);
+        my $dev = "/dev/ngnvme${ctrl_idx}";
+        if (-e $dev) {
+            my $ret = system('nvme', 'disconnect', $dev);
+            _log({}, 2, "[Nasty] disconnected NVMe controller $dev (ret=$ret)");
+        }
+    }
+}
+
 sub _nvme_hostid_for_hostnqn {
     my ($hostnqn) = @_;
     my $hex = sha1_hex('nastyplugin:' . ($hostnqn // ''));
@@ -906,6 +925,13 @@ sub free_image {
     if (my $block_device = $sv->{block_device}) {
         eval { _remove_from_share($scfg, $block_device) };
         warn "[Nasty] free_image: remove_from_share warning: $@" if $@;
+    }
+    # For NVMe-TCP, disconnect the PVE-side NVMe controller so NASty can
+    # release the block device.  Without this the subvolume.delete fails with
+    # "subvolume is in use by NVMe-oF subsystem".
+    if ($scfg->{nasty_transport_mode} eq 'nvme-tcp' && my $nqn = $scfg->{nasty_nvme_subsystem}) {
+        _log($scfg, 2, "[Nasty] free_image: disconnecting NVMe controller for $nqn");
+        _nvme_disconnect($nqn);
     }
 
     _api_call($scfg, 'subvolume.delete', { filesystem => $fs, name => $volname });
