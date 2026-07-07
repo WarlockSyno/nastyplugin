@@ -535,8 +535,9 @@ sub _iscsi_rescan {
 # Returns nsid or undef if not found.
 sub _nvme_find_ns {
     my ($scfg, $block_device) = @_;
-    my $subsystems = _api_call($scfg, 'share.nvmeof.list');
     my $target_name = $scfg->{nasty_nvme_subsystem};
+    return undef unless defined $target_name && $target_name ne '';
+    my $subsystems = _api_call($scfg, 'share.nvmeof.list');
     for my $s (@$subsystems) {
         next unless ($s->{nqn} // '') =~ /\Q$target_name\E/ || ($s->{id} // '') eq $target_name;
         for my $ns (@{ $s->{namespaces} // [] }) {
@@ -548,8 +549,9 @@ sub _nvme_find_ns {
 
 sub _nvme_subsystem_id {
     my ($scfg) = @_;
-    my $subsystems = _api_call($scfg, 'share.nvmeof.list');
     my $target_name = $scfg->{nasty_nvme_subsystem};
+    return undef unless defined $target_name && $target_name ne '';
+    my $subsystems = _api_call($scfg, 'share.nvmeof.list');
     for my $s (@$subsystems) {
         return $s->{id}
             if ($s->{nqn} // '') =~ /\Q$target_name\E/
@@ -590,7 +592,7 @@ sub _nvme_disconnect {
         my $dev = "/dev/ngnvme${ctrl_idx}";
         if (-e $dev) {
             my $ret = system('nvme', 'disconnect', $dev);
-            _log({}, 2, "[Nasty] disconnected NVMe controller $dev (ret=$ret)");
+            _log({ nasty_log_level => 1 }, 2, "[Nasty] disconnected NVMe controller $dev (ret=$ret)");
         }
     }
 }
@@ -663,13 +665,86 @@ sub _add_to_share {
     my ($scfg, $block_device) = @_;
     my $mode = $scfg->{nasty_transport_mode} // 'iscsi';
     if ($mode eq 'iscsi') {
+        # Check if the LUN is already exposed for this block device.
+        # Stale configfs state from previous runs can cause add_lun to fail
+        # with "Device or resource busy" even though the LUN is already active.
+        my $existing_lun = _iscsi_find_lun($scfg, $block_device);
+        if (defined $existing_lun) {
+            _log($scfg, 2, "[Nasty] _add_to_share: LUN $existing_lun already exists for $block_device (skipping add_lun)");
+            return { lun_id => $existing_lun };
+        }
         my $tid = _iscsi_target_id($scfg);
-        return _api_call($scfg, 'share.iscsi.add_lun', {
-            target_id    => $tid,
-            backstore_path => $block_device,
-        });
+        my $result;
+        my $add_err;
+        eval {
+            $result = _api_call($scfg, 'share.iscsi.add_lun', {
+                target_id    => $tid,
+                backstore_path => $block_device,
+            });
+        };
+        $add_err = $@;
+        if ($add_err) {
+            # If the error is "Device or resource busy", the LUN is already enabled
+            # in configfs on the NASty backend from a previous run. The subvolume.create
+            # succeeded and created a block_device, but add_lun failed because configfs
+            # already has this LUN enabled. We need to verify the LUN is in the API listing.
+            if ($add_err =~ /Device or resource busy/) {
+                _log($scfg, 1, "[Nasty] _add_to_share: add_lun failed with busy error, checking if LUN already exposed");
+                # Re-query the API to find the LUN for this block_device
+                my $lun_id = _iscsi_find_lun($scfg, $block_device);
+                if (defined $lun_id) {
+                    _log($scfg, 1, "[Nasty] _add_to_share: LUN $lun_id already exposed for $block_device (recovered from busy error)");
+                    return { lun_id => $lun_id };
+                }
+                # LUN not in API listing - the configfs entry exists but wasn't added to API.
+                # This is a stale state from a previous run. We need to clean up the stale
+                # configfs entry by removing the LUN from the NASty API first, then retry.
+                # But since the LUN isn't in the API listing, we can't remove it.
+                # Instead, we'll delete the subvolume and let the retry create a new one.
+                _log($scfg, 1, "[Nasty] _add_to_share: LUN not in API listing, will retry with new subvolume");
+                die $add_err;  # Re-throw to trigger retry in caller
+            }
+            # If the error mentions the device is already exported via NVMe-oF, we need to
+            # remove the NVMe-oF namespace first, then retry add_lun.
+            if ($add_err =~ /already exported via NVMe-oF/) {
+                _log($scfg, 1, "[Nasty] _add_to_share: device $block_device already exported via NVMe-oF, removing namespace first");
+                # Remove the NVMe-oF namespace for this block_device
+                my $sid = _nvme_subsystem_id($scfg);
+                my $nsid = _nvme_find_ns($scfg, $block_device);
+                if (defined $nsid) {
+                    eval {
+                        _api_call($scfg, 'share.nvmeof.remove_namespace', {
+                            subsystem_id => $sid,
+                            nsid         => $nsid,
+                        });
+                    };
+                    if ($@) {
+                        _log($scfg, 1, "[Nasty] _add_to_share: failed to remove NVMe-oF namespace $nsid: $@");
+                        die $add_err;  # Re-throw original error
+                    }
+                    _log($scfg, 1, "[Nasty] _add_to_share: removed NVMe-oF namespace $nsid, will retry add_lun");
+                    # Retry add_lun after removing NVMe-oF namespace
+                    $result = _api_call($scfg, 'share.iscsi.add_lun', {
+                        target_id    => $tid,
+                        backstore_path => $block_device,
+                    });
+                    return $result;
+                }
+                # Namespace not found - re-throw original error
+                die $add_err;
+            }
+            die $add_err;
+        }
+        return $result;
     } elsif ($mode eq 'nvme-tcp') {
+        # Check if the namespace is already exposed for this block device.
+        my $existing_ns = _nvme_find_ns($scfg, $block_device);
+        if (defined $existing_ns) {
+            _log($scfg, 2, "[Nasty] _add_to_share: namespace $existing_ns already exists for $block_device (skipping add_namespace)");
+            return { nsid => $existing_ns };
+        }
         my $sid = _nvme_subsystem_id($scfg);
+        return unless defined $sid;  # NVMe-TCP not configured
         return _api_call($scfg, 'share.nvmeof.add_namespace', {
             subsystem_id => $sid,
             device_path  => $block_device,
@@ -719,10 +794,25 @@ sub _remove_from_share {
         my $nsid = _nvme_find_ns($scfg, $block_device);
         return unless defined $nsid;
         my $sid = _nvme_subsystem_id($scfg);
-        _api_call($scfg, 'share.nvmeof.remove_namespace', {
-            subsystem_id => $sid,
-            nsid         => $nsid,
-        });
+        return unless defined $sid;  # NVMe-TCP not configured
+        eval {
+            _api_call($scfg, 'share.nvmeof.remove_namespace', {
+                subsystem_id => $sid,
+                nsid         => $nsid,
+            });
+        };
+        # remove_namespace may fail if the namespace is already removed or stuck in
+        # configfs (e.g. stale entries from previous test runs).  If the namespace
+        # no longer appears in the API listing, that confirms it is gone — silently
+        # ignore the failure.
+        if ($@) {
+            my $nsid_check = _nvme_find_ns($scfg, $block_device);
+            unless (defined $nsid_check) {
+                _log($scfg, 2, "[Nasty] _remove_from_share: namespace $nsid no longer exists on NASty (ignored)");
+            } else {
+                warn "[Nasty] _remove_from_share: remove_namespace failed: $@\n";
+            }
+        }
     } else {
         die "[Nasty] unknown transport mode '$mode'\n";
     }
@@ -923,15 +1013,18 @@ sub free_image {
     }
 
     if (my $block_device = $sv->{block_device}) {
+        # For NVMe-TCP, disconnect the PVE-side NVMe controller first so NASty can
+        # release the block device.  Without this the remove_namespace / subvolume.delete
+        # fails with "device or resource busy".
+        if ($scfg->{nasty_transport_mode} eq 'nvme-tcp') {
+            my $nqn = $scfg->{nasty_nvme_subsystem};
+            if ($nqn) {
+                _log($scfg, 2, "[Nasty] free_image: disconnecting NVMe controller for $nqn before cleanup");
+                _nvme_disconnect($nqn);
+            }
+        }
         eval { _remove_from_share($scfg, $block_device) };
         warn "[Nasty] free_image: remove_from_share warning: $@" if $@;
-    }
-    # For NVMe-TCP, disconnect the PVE-side NVMe controller so NASty can
-    # release the block device.  Without this the subvolume.delete fails with
-    # "subvolume is in use by NVMe-oF subsystem".
-    if ($scfg->{nasty_transport_mode} eq 'nvme-tcp' && my $nqn = $scfg->{nasty_nvme_subsystem}) {
-        _log($scfg, 2, "[Nasty] free_image: disconnecting NVMe controller for $nqn");
-        _nvme_disconnect($nqn);
     }
 
     _api_call($scfg, 'subvolume.delete', { filesystem => $fs, name => $volname });
@@ -965,10 +1058,16 @@ sub _resolve_dev_path {
     if ($mode eq 'iscsi') {
         my $lun_id = _iscsi_find_lun($scfg, $block_device);
         unless (defined $lun_id) {
-            # Namespace may have been removed from the share (e.g. stale volume after NASty
+            # LUN may have been removed from the share (e.g. stale volume after NASty
             # restart). Re-expose it so path() can proceed and free_image can clean up.
             _log($scfg, 2, "[Nasty] _resolve_dev_path: LUN missing for $block_device, re-exposing");
-            _add_to_share($scfg, $block_device);
+            eval {
+                _add_to_share($scfg, $block_device);
+            };
+            if ($@) {
+                _log($scfg, 1, "[Nasty] _resolve_dev_path: could not re-expose $block_device (subvolume may be gone)");
+                return undef;
+            }
             $lun_id = _iscsi_find_lun($scfg, $block_device);
             die "[Nasty] no LUN found for block device $block_device after re-exposing\n" unless defined $lun_id;
         }
@@ -983,7 +1082,13 @@ sub _resolve_dev_path {
             # Namespace may have been removed from the share (e.g. stale volume after NASty
             # restart). Re-expose it so path() can proceed and free_image can clean up.
             _log($scfg, 2, "[Nasty] _resolve_dev_path: NVMe namespace missing for $block_device, re-exposing");
-            _add_to_share($scfg, $block_device);
+            eval {
+                _add_to_share($scfg, $block_device);
+            };
+            if ($@) {
+                _log($scfg, 1, "[Nasty] _resolve_dev_path: could not re-expose $block_device (subvolume may be gone)");
+                return undef;
+            }
             $nsid = _nvme_find_ns($scfg, $block_device);
             die "[Nasty] no NVMe namespace found for block device $block_device after re-exposing\n" unless defined $nsid;
         }
