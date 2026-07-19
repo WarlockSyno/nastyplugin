@@ -338,17 +338,23 @@ sub _ws_send_frame {
         $header = pack('CCN', 0x81, 0x80 | 127, 0) . pack('N', $len);
     }
 
-    print $sock $header . $mask . $masked;
+    my $data = $header . $mask . $masked;
+    my $written = $sock->syswrite($data, length($data))
+        // die "[Nasty] WebSocket write error: $!\n";
+    die "[Nasty] WebSocket write truncated\n" if $written != length($data);
 }
 
 sub _ws_recv_frame {
     my ($sock) = @_;
 
     for my $attempt (1..50) {
-        # Read 2-byte header
+        # Read 2-byte header (30s timeout)
+        my $sel = IO::Select->new($sock);
+        unless ($sel->can_read(30)) {
+            die "[Nasty] WebSocket read timed out after 30s\n";
+        }
         my $hdr = '';
         $sock->read($hdr, 2) == 2 or die "[Nasty] WebSocket read error: connection closed\n";
-        my ($b0, $b1) = unpack('CC', $hdr);
 
         my $opcode = $b0 & 0x0f;
         my $len    = $b1 & 0x7f;
