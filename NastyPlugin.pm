@@ -744,7 +744,7 @@ sub _add_to_share {
             return { nsid => $existing_ns };
         }
         my $sid = _nvme_subsystem_id($scfg);
-        return unless defined $sid;  # NVMe-TCP not configured
+        die "[Nasty] _add_to_share: NVMe subsystem not configured\n" unless defined $sid;  # NVMe-TCP not configured
         return _api_call($scfg, 'share.nvmeof.add_namespace', {
             subsystem_id => $sid,
             device_path  => $block_device,
