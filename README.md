@@ -43,4 +43,4 @@ GPL-3.0. See [LICENSE](LICENSE).
 
 ---
 
-**Version:** 0.1.12 — 2026-07-19
+**Version:** 0.1.13 — 2026-07-19

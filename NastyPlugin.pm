@@ -45,7 +45,7 @@ my %CACHE_INVALIDATE = (
     'share.nvmeof.remove_namespace' => ['share.nvmeof.list'],
 );
 
-our $VERSION = '0.1.12';
+our $VERSION = '0.1.13';
 
 sub api {
     my $tested_apiver = 14;
@@ -355,6 +355,7 @@ sub _ws_recv_frame {
         }
         my $hdr = '';
         $sock->read($hdr, 2) == 2 or die "[Nasty] WebSocket read error: connection closed\n";
+        my ($b0, $b1) = unpack('CC', $hdr);
 
         my $opcode = $b0 & 0x0f;
         my $len    = $b1 & 0x7f;

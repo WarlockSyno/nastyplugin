@@ -1,3 +1,14 @@
+nasty-proxmox-plugin (0.1.13) bookworm; urgency=medium
+
+  * Fix compile-breaking regression in _ws_recv_frame: restore unpack('CC', $hdr)
+    that populates $b0/$b1, dropped by the 0.1.12 WebSocket read-timeout change.
+  * Fix Phase 49 test (_resolve_dev_path stale volume recovery): match the
+    resolved block device path instead of the volume name against the API's
+    device_path field so the LUN/namespace is actually removed before recovery
+    is exercised.
+
+ -- NastyPlugin Maintainers <noreply@github.com>  Sat, 19 Jul 2026 00:00:00 +0000
+
 nasty-proxmox-plugin (0.1.12) bookworm; urgency=medium
 
   * Fix debian/changelog corruption: remove orphaned version header, restore
@@ -19,6 +30,13 @@ nasty-proxmox-plugin (0.1.11) bookworm; urgency=medium
   * Fixed NVMe-TCP disk deletion: _nvme_disconnect helper now disconnects PVE-side NVMe controllers
     before calling subvolume.delete, preventing "subvolume is in use by NVMe-oF subsystem" errors.
  -- NastyPlugin Maintainers <noreply@github.com>  Sat, 05 Jul 2026 00:00:00 +0000
+
+nasty-proxmox-plugin (0.1.10) bookworm; urgency=medium
+
+  * Add 1s delay after volume_resize to let NASty propagate the size change.
+
+ -- NastyPlugin Maintainers <noreply@github.com>  Sun, 05 Jul 2026 00:00:00 +0000
+
 nasty-proxmox-plugin (0.1.9) bookworm; urgency=medium
 
   * Fixed unused variable in free_image (removed dead $err assignment).

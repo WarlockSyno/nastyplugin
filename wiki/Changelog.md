@@ -1,4 +1,14 @@
 # Changelog
+## 0.1.13 — 2026-07-19
+
+- Fix compile-breaking regression in `_ws_recv_frame`: the 0.1.12 WebSocket read-timeout change
+  dropped the `unpack('CC', $hdr)` call that populates `$b0`/`$b1`, leaving the plugin unable to
+  load under `use strict`. Restored.
+- Fix Phase 49 test (`_resolve_dev_path` stale volume recovery): the LUN/namespace lookup compared
+  the volume name against the API's `device_path` field and never matched, so the test never
+  actually removed the LUN/namespace it was supposed to and passed trivially. Now resolves the
+  real block device path via `pvesm path` first and matches on that.
+
 ## 0.1.12 — 2026-07-19
 
 - Fix debian/changelog corruption: remove orphaned version header, restore missing 0.1.7/0.1.8
@@ -19,6 +29,11 @@
     before calling `subvolume.delete`, preventing "subvolume is in use by NVMe-oF subsystem" errors.
     The plugin now explicitly removes NVMe namespaces from the NASty subsystem in `_remove_from_share`
     before attempting subvolume deletion.
+
+## 0.1.10 — 2026-07-05
+
+- Add 1s delay after `volume_resize` to let NASty propagate the size change before returning.
+
 ## 0.1.9 — 2026-07-05
 - Fixed unused variable in `free_image` (removed dead `$err` assignment).
 - Fixed subvolume leak in `alloc_image`: orphaned subvolumes now cleaned up on `subvolume.create` failure, `_add_to_share` failure, or missing `block_device`.

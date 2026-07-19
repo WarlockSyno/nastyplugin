@@ -1577,7 +1577,12 @@ test_resolve_dev_path_recovery() {
            NASTY_FILESYSTEM="$filesystem" NASTY_PREFIX="$prefix" NASTY_TRANSPORT="$transport" \
            NASTY_ISCSI_TARGET="$iscsi_target" NASTY_NVME_SUBSYSTEM="$nvme_subsystem"
 
-    local volname="${volid#*:}"
+    # Resolve the current block device path so it can be matched against the
+    # API's device_path field below (device_path is the block device path,
+    # not the volume name).
+    local block_device
+    block_device=$(pvesm path "$volid" 2>/dev/null) \
+        || { record_fail "$test_name" "could not resolve initial path"; delete_vm_and_disks "$vmid"; return 1; }
 
     # Manually remove the LUN/namespace from the NASty share to simulate a
     # stale state (e.g., NASty restart cleared the share but left the subvolume).
@@ -1594,7 +1599,7 @@ test_resolve_dev_path_recovery() {
                 }
             }
             exit 1;
-        ' BLOCK_DEVICE="$volname" 2>/dev/null || echo "")
+        ' BLOCK_DEVICE="$block_device" 2>/dev/null || echo "")
         if [[ -n "$nsid" ]]; then
             tn_api_call "$api_host" "$api_token" "share.nvmeof.remove_namespace" \
                 "{\"subsystem_id\":\"$nvme_subsystem\",\"nsid\":$nsid}" "$api_verify_ssl" >/dev/null 2>&1 || true
@@ -1623,7 +1628,7 @@ test_resolve_dev_path_recovery() {
                     }
                 }
                 exit 1;
-            ' TID="$tid" BLOCK_DEVICE="$volname" 2>/dev/null || echo "")
+            ' TID="$tid" BLOCK_DEVICE="$block_device" 2>/dev/null || echo "")
             if [[ -n "$lun_id" ]]; then
                 tn_api_call "$api_host" "$api_token" "share.iscsi.remove_lun" \
                     "{\"target_id\":$tid,\"lun_id\":$lun_id}" "$api_verify_ssl" >/dev/null 2>&1 || true
