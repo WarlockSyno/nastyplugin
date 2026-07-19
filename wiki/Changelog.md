@@ -1,4 +1,18 @@
 # Changelog
+## 0.1.12 — 2026-07-19
+
+- Fix debian/changelog corruption: remove orphaned version header, restore missing 0.1.7/0.1.8
+  headers, reorder entries in descending order.
+- Remove unused liburi-perl from Depends.
+- _add_to_share NVMe path now dies with clear error instead of silently returning undef when
+  subsystem is not configured.
+- Add 30s WebSocket read timeout to prevent hung pvedaemon workers.
+- Add write error detection to _ws_send_frame using syswrite.
+- Add runtime Perl dependencies to CI build container.
+- _nvme_disconnect now reuses _nvme_find_ctrl_idx sysfs scanning.
+- Add test phases 47-49 covering API retry path, concurrent alloc collision resolution, and
+  _resolve_dev_path stale volume recovery.
+
 ## 0.1.11 — 2026-07-05
 
   Fixed NVMe-TCP disk deletion: `_nvme_disconnect` helper now disconnects PVE-side NVMe controllers

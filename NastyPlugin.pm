@@ -45,7 +45,7 @@ my %CACHE_INVALIDATE = (
     'share.nvmeof.remove_namespace' => ['share.nvmeof.list'],
 );
 
-our $VERSION = '0.1.11';
+our $VERSION = '0.1.12';
 
 sub api {
     my $tested_apiver = 14;
