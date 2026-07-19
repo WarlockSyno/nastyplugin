@@ -1505,9 +1505,14 @@ test_api_retry_path() {
     record_pass "$test_name"
 }
 
-# Phase 48: Trigger concurrent disk allocation collision and verify retry loop.
-# Both nodes allocate disk-0 for the SAME VMID simultaneously — one subvolume.create
-# will win, the other will collide, retry, and pick a different disk number.
+# Phase 48: Trigger concurrent disk allocation collision and verify the loser
+# fails cleanly without corrupting the winner's volume. Both nodes request the
+# same explicit volume name for the same VMID simultaneously. alloc_image only
+# picks a new disk number on retry when the caller omits an explicit name (see
+# the `if ($name)` branch) — an explicit-name collision can only ever be won
+# by one caller, so the meaningful assertion is that exactly one request wins
+# and the loser's failure-path cleanup (subvolume.delete on the shared name)
+# does not delete the winner's already-created volume out from under it.
 test_concurrent_alloc_retry() {
     local test_num="$1"
     local test_name="[$test_num] Concurrent Allocation Retry Loop"
@@ -1545,13 +1550,25 @@ test_concurrent_alloc_retry() {
     [[ -f "$err/local" && "$(cat "$err/local")" == "OK" ]] && local_ok=1
     [[ -f "$err/remote" && "$(cat "$err/remote")" == "OK" ]] && remote_ok=1
 
+    # Verify the winner's volume survived the loser's failure-path cleanup
+    # before we tear everything down.
+    local winner_survived=0
+    pvesm list "$STORAGE_ID" --vmid "$vmid" 2>/dev/null | grep -q "vm-${vmid}-disk-0" && winner_survived=1
+
     delete_vm_and_disks "$vmid"
     ssh "$TARGET_NODE" "for v in \$(pvesm list $STORAGE_ID --vmid $vmid 2>/dev/null | tail -n +2 | awk '{print \$1}'); do pvesm free \$v 2>/dev/null; done; qm destroy $vmid 2>/dev/null" || true
     rm -rf "$err"
 
-    [[ $local_ok -eq 1 && $remote_ok -eq 1 ]] \
-        || { record_fail "$test_name" "concurrent allocation collision not resolved: local=$local_ok remote=$remote_ok"; return 1; }
-    log_success "Concurrent allocation retry: both nodes succeeded (collision resolved)"
+    local winners=$((local_ok + remote_ok))
+    if [[ $winners -ne 1 ]]; then
+        record_fail "$test_name" "expected exactly one concurrent allocation to win: local=$local_ok remote=$remote_ok"
+        return 1
+    fi
+    if [[ $winner_survived -ne 1 ]]; then
+        record_fail "$test_name" "winning volume did not survive the loser's failure-cleanup path"
+        return 1
+    fi
+    log_success "Concurrent allocation collision handled: one request won (local=$local_ok remote=$remote_ok), winner's volume intact"
     record_pass "$test_name"
 }
 
