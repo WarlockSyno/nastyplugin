@@ -68,7 +68,7 @@ jobs:
       - name: Install build dependencies
         run: |
           apt-get update -qq
-          apt-get install -y --no-install-recommends git build-essential debhelper perl
+          apt-get install -y --no-install-recommends git build-essential debhelper perl libio-socket-ssl-perl libjson-xs-perl
 
       - name: Patch changelog for pre-release builds
         if: |
