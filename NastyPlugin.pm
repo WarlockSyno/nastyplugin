@@ -586,20 +586,12 @@ sub _nvme_find_ctrl_idx {
 
 sub _nvme_disconnect {
     my ($target_nqn) = @_;
-    for my $ctl_dir (glob('/sys/class/nvme-fabrics/ctl/nvme*')) {
-        my $nqn_file = "$ctl_dir/subsysnqn";
-        next unless -f $nqn_file;
-        open(my $fh, '<', $nqn_file) or next;
-        my $nqn = do { local $/; <$fh> };
-        close($fh);
-        chomp $nqn;
-        next unless $nqn eq $target_nqn || $nqn =~ /\Q$target_nqn\E/;
-        my ($ctrl_idx) = ($ctl_dir =~ m!/nvme(\d+)$!);
-        my $dev = "/dev/ngnvme${ctrl_idx}";
-        if (-e $dev) {
-            my $ret = system('nvme', 'disconnect', $dev);
-            _log({ nasty_log_level => 1 }, 2, "[Nasty] disconnected NVMe controller $dev (ret=$ret)");
-        }
+    my $ctrl_idx = _nvme_find_ctrl_idx($target_nqn);
+    return unless defined $ctrl_idx;
+    my $dev = "/dev/ngnvme${ctrl_idx}";
+    if (-e $dev) {
+        my $ret = system('nvme', 'disconnect', $dev);
+        _log({ nasty_log_level => 1 }, 2, "[Nasty] disconnected NVMe controller $dev (ret=$ret)");
     }
 }
 
