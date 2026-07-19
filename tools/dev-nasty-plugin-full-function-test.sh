@@ -1453,6 +1453,198 @@ test_lxc_offline_backup() {
     record_pass "$test_name"
 }
 
+
+# Phase 47: Simulate mid-operation NASty disconnect and verify _api_call retry recovery.
+# Uses iptables REJECT (TCP RST) to kill the active WebSocket connection mid-operation.
+# The _api_call retry loop detects the dead socket, reconnects, and completes the request.
+test_api_retry_path() {
+    local test_num="$1"
+    local test_name="[$test_num] API Connection Retry Path"
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+
+    local api_host vmid tmpdir pid exit_code volid
+    api_host=$(get_storage_config "$STORAGE_ID" | cut -d'|' -f1)
+    vmid=$((VMID_START + 45))
+    delete_vm_and_disks "$vmid"
+
+    qm create "$vmid" -name "test-api-retry" -memory 512 >/dev/null 2>&1 \
+        || { record_fail "$test_name" "VM create failed"; return 1; }
+
+    tmpdir=$(mktemp -d)
+
+    # Start allocation, let WS connection establish, then REJECT connections.
+    # The REJECT sends TCP RST killing the active WS.  _api_call recv fails,
+    # the cached socket is invalidated, and the retry reconnects once the
+    # REJECT rule is removed.
+    (
+        pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+            -vmid "$vmid" -filename "vm-${vmid}-disk-0" -size "1G" \
+            --output-format=json 2>/dev/null | extract_first_volid > "$tmpdir/volid"
+        echo $? > "$tmpdir/exit"
+    ) &
+    pid=$!
+
+    sleep 2   # wait for WS connection and subvolume.create to complete
+    iptables -A OUTPUT -d "$api_host" -p tcp --dport 443 -j REJECT --reject-with tcp-reset
+    sleep 3   # keep REJECT active long enough for retry mechanism to engage
+    iptables -D OUTPUT -d "$api_host" -p tcp --dport 443 -j REJECT --reject-with tcp-reset
+
+    wait "$pid" 2>/dev/null || true
+
+    exit_code=$(cat "$tmpdir/exit" 2>/dev/null || echo 1)
+    volid=$(cat "$tmpdir/volid" 2>/dev/null || echo "")
+    delete_vm_and_disks "$vmid"
+    rm -rf "$tmpdir"
+
+    # Cleanup stray iptables rule
+    iptables -D OUTPUT -d "$api_host" -p tcp --dport 443 -j REJECT --reject-with tcp-reset 2>/dev/null || true
+
+    [[ "$exit_code" -eq 0 && -n "$volid" ]] \
+        || { record_fail "$test_name" "allocation did not survive connection reset (exit=$exit_code volid=${volid:-none})"; return 1; }
+    log_success "API retry path verified: allocation succeeded after connection reset"
+    record_pass "$test_name"
+}
+
+# Phase 48: Trigger concurrent disk allocation collision and verify retry loop.
+# Both nodes allocate disk-0 for the SAME VMID simultaneously — one subvolume.create
+# will win, the other will collide, retry, and pick a different disk number.
+test_concurrent_alloc_retry() {
+    local test_num="$1"
+    local test_name="[$test_num] Concurrent Allocation Retry Loop"
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+
+    if [[ $IS_CLUSTER -ne 1 ]]; then
+        record_skip_as_pass "$test_name" "not in cluster"
+        return 0
+    fi
+
+    local vmid=$((VMID_START + 46))
+    # Clean up from prior runs
+    delete_vm_and_disks "$vmid"
+    ssh "$TARGET_NODE" "qm destroy $vmid 2>/dev/null
+        for v in \$(pvesm list $STORAGE_ID --vmid $vmid 2>/dev/null | tail -n +2 | awk '{print \$1}'); do
+            pvesm free \$v 2>/dev/null
+        done" || true
+
+    qm create "$vmid" -name "test-conc-alloc" -memory 512 >/dev/null 2>&1 \
+        || { record_fail "$test_name" "VM create failed"; return 1; }
+
+    local err local_ok=0 remote_ok=0
+    err=$(mktemp -d)
+
+    # Both nodes allocate disk-0 for the same VMID — collision guaranteed.
+    (pvesh create "/nodes/$NODE/storage/$STORAGE_ID/content" \
+        -vmid "$vmid" -filename "vm-${vmid}-disk-0" -size "1G" \
+        --output-format=json >/dev/null 2>&1 && echo OK > "$err/local") &
+    (ssh "$TARGET_NODE" "pvesh create /nodes/$TARGET_NODE/storage/$STORAGE_ID/content \
+        -vmid $vmid -filename vm-${vmid}-disk-0 -size 1G \
+        --output-format=json 2>/dev/null" >/dev/null 2>&1 && echo OK > "$err/remote") &
+
+    wait
+
+    [[ -f "$err/local" && "$(cat "$err/local")" == "OK" ]] && local_ok=1
+    [[ -f "$err/remote" && "$(cat "$err/remote")" == "OK" ]] && remote_ok=1
+
+    delete_vm_and_disks "$vmid"
+    ssh "$TARGET_NODE" "for v in \$(pvesm list $STORAGE_ID --vmid $vmid 2>/dev/null | tail -n +2 | awk '{print \$1}'); do pvesm free \$v 2>/dev/null; done; qm destroy $vmid 2>/dev/null" || true
+    rm -rf "$err"
+
+    [[ $local_ok -eq 1 && $remote_ok -eq 1 ]] \
+        || { record_fail "$test_name" "concurrent allocation collision not resolved: local=$local_ok remote=$remote_ok"; return 1; }
+    log_success "Concurrent allocation retry: both nodes succeeded (collision resolved)"
+    record_pass "$test_name"
+}
+
+# Phase 49: Verify _resolve_dev_path auto-re-exposes a volume when its LUN/namespace
+# has been removed from the NASty share (e.g., after NASty restart).
+test_resolve_dev_path_recovery() {
+    local test_num="$1"
+    local test_name="[$test_num] Resolve Dev Path Stale Volume Recovery"
+    echo "[$test_num] Testing: $test_name" | tee -a "$LOG_FILE"
+
+    local vmid=$((VMID_START + 47))
+    delete_vm_and_disks "$vmid"
+
+    local volid
+    volid=$(create_vm_with_disk "$vmid" "test-recovery" "1G") \
+        || { record_fail "$test_name" "initial allocation failed"; return 1; }
+
+    # Get storage config for API calls
+    local config api_host api_token api_verify_ssl filesystem prefix transport iscsi_target nvme_subsystem
+    config=$(get_storage_config "$STORAGE_ID")
+    IFS='|' read -r api_host _ _ api_token api_verify_ssl filesystem prefix transport iscsi_target nvme_subsystem _ <<< "$config"
+    export NASTY_API_PORT="${NASTY_API_PORT:-443}" NASTY_API_SCHEME="${NASTY_API_SCHEME:-wss}" \
+           NASTY_FILESYSTEM="$filesystem" NASTY_PREFIX="$prefix" NASTY_TRANSPORT="$transport" \
+           NASTY_ISCSI_TARGET="$iscsi_target" NASTY_NVME_SUBSYSTEM="$nvme_subsystem"
+
+    local volname="${volid#*:}"
+
+    # Manually remove the LUN/namespace from the NASty share to simulate a
+    # stale state (e.g., NASty restart cleared the share but left the subvolume).
+    if [[ "$transport" == "nvme-tcp" ]]; then
+        local subsystems nsid
+        subsystems=$(tn_api_call "$api_host" "$api_token" "share.nvmeof.list" '{}' "$api_verify_ssl" 2>/dev/null || true)
+        nsid=$(echo "$subsystems" | perl -MJSON::PP -e '
+            my $d = eval { decode_json(do { local $/; <STDIN> }) } // [];
+            for my $sub (@$d) {
+                for my $ns (@{$sub->{namespaces} // []}) {
+                    if (($ns->{device_path} // "") eq $ENV{BLOCK_DEVICE}) {
+                        print $ns->{nsid}; exit 0;
+                    }
+                }
+            }
+            exit 1;
+        ' BLOCK_DEVICE="$volname" 2>/dev/null || echo "")
+        if [[ -n "$nsid" ]]; then
+            tn_api_call "$api_host" "$api_token" "share.nvmeof.remove_namespace" \
+                "{\"subsystem_id\":\"$nvme_subsystem\",\"nsid\":$nsid}" "$api_verify_ssl" >/dev/null 2>&1 || true
+        fi
+    else
+        local targets tid lun_id
+        targets=$(tn_api_call "$api_host" "$api_token" "share.iscsi.list" '{}' "$api_verify_ssl" 2>/dev/null || true)
+        tid=$(echo "$targets" | perl -MJSON::PP -e '
+            my $d = eval { decode_json(do { local $/; <STDIN> }) } // [];
+            my $tgt = $ENV{ISCSI_TARGET} // "";
+            for my $t (@$d) {
+                if (($t->{iqn} // "") eq $tgt) { print $t->{id}; exit 0; }
+            }
+            exit 1;
+        ' ISCSI_TARGET="$iscsi_target" 2>/dev/null || echo "")
+        if [[ -n "$tid" ]]; then
+            lun_id=$(echo "$targets" | perl -MJSON::PP -e '
+                my $d = eval { decode_json(do { local $/; <STDIN> }) } // [];
+                my $tid = 0 + ($ENV{TID} // 0);
+                for my $t (@$d) {
+                    next unless $t->{id} == $tid;
+                    for my $lun (@{$t->{luns} // []}) {
+                        if (($lun->{device_path} // "") eq $ENV{BLOCK_DEVICE}) {
+                            print $lun->{lun_id}; exit 0;
+                        }
+                    }
+                }
+                exit 1;
+            ' TID="$tid" BLOCK_DEVICE="$volname" 2>/dev/null || echo "")
+            if [[ -n "$lun_id" ]]; then
+                tn_api_call "$api_host" "$api_token" "share.iscsi.remove_lun" \
+                    "{\"target_id\":$tid,\"lun_id\":$lun_id}" "$api_verify_ssl" >/dev/null 2>&1 || true
+            fi
+        fi
+    fi
+
+    # Now resolve the path — _resolve_dev_path should detect the missing
+    # LUN/namespace, call _add_to_share to re-expose it, and return the block device.
+    local path
+    if path=$(pvesm path "$volid" 2>/dev/null); then
+        [[ -b "$path" ]] || { record_fail "$test_name" "path $path is not a block device"; delete_vm_and_disks "$vmid"; return 1; }
+        log_success "Stale volume re-exposed: $volid -> $path"
+        record_pass "$test_name"
+    else
+        record_fail "$test_name" "pvesm path failed to re-expose stale volume"
+    fi
+
+    delete_vm_and_disks "$vmid"
+}
+
 print_performance_summary() {
     echo "════════════════════════════════════════════════════════════════════" | tee -a "$LOG_FILE"
     echo "  PERFORMANCE SUMMARY" | tee -a "$LOG_FILE"
@@ -1548,6 +1740,10 @@ main() {
     if [[ $START_PHASE -le 44 ]]; then run_phase_header "PHASE 44: LXC Concurrent Creation/Destruction"; test_lxc_concurrent "$((LXC_VMID_START + 30))" "$test_num"; test_num=$((test_num+1)); fi; check_stop_phase 44
     if [[ $START_PHASE -le 45 ]]; then run_phase_header "PHASE 45: LXC Online Backup"; test_lxc_online_backup "$((LXC_VMID_START + 6))" "$test_num"; test_num=$((test_num+1)); fi; check_stop_phase 45
     if [[ $START_PHASE -le 46 ]]; then run_phase_header "PHASE 46: LXC Offline Backup"; test_lxc_offline_backup "$((LXC_VMID_START + 7))" "$test_num"; test_num=$((test_num+1)); fi; check_stop_phase 46
+    if [[ $START_PHASE -le 47 ]]; then run_phase_header "PHASE 47: API Connection Retry Path"; test_api_retry_path "$test_num"; test_num=$((test_num+1)); fi; check_stop_phase 47
+    if [[ $START_PHASE -le 48 ]]; then run_phase_header "PHASE 48: Concurrent Allocation Retry Loop"; test_concurrent_alloc_retry "$test_num"; test_num=$((test_num+1)); fi; check_stop_phase 48
+    if [[ $START_PHASE -le 49 ]]; then run_phase_header "PHASE 49: Resolve Dev Path Stale Volume Recovery"; test_resolve_dev_path_recovery "$test_num"; test_num=$((test_num+1)); fi; check_stop_phase 49
+
 
     print_performance_summary
     local end_time total_duration
